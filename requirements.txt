@@ -1,0 +1,14 @@
+gradio==5.27.0
+gradio_client==1.10.4
+torch
+torchaudio
+acestep
+diffusers
+transformers
+peft
+datasets
+huggingface_hub
+librosa
+soundfile
+numpy
+scipy
