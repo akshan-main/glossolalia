@@ -13,6 +13,10 @@ import json
 import sys
 from pathlib import Path
 
+# Make `patches/` (at the repo root) importable when this script is run via `python scripts/sweep_dial.py`
+# (Python adds the script's dir to sys.path[0], not the cwd, so we add the repo root explicitly).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 LEVEL_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven"]
 DEFAULT_HOLDOUT_SENTENCES = [
     "the river was wide and calm in the morning light",
@@ -59,9 +63,12 @@ def main():
 
     try:
         import patches  # noqa: F401 — installs F5TTS.load_lora (DECISIONS.md "F5-TTS LoRA path = DIY PEFT")
+    except ImportError as e:
+        print(f"could not import patches/ from {Path(__file__).resolve().parent.parent}: {e}", file=sys.stderr); sys.exit(1)
+    try:
         from f5_tts.api import F5TTS
-    except ImportError:
-        print("install f5-tts before running the sweep.", file=sys.stderr); sys.exit(1)
+    except ImportError as e:
+        print(f"could not import f5_tts: {e}", file=sys.stderr); sys.exit(1)
     tts = F5TTS(model=args.model)
     tts.load_lora(args.lora)
 
