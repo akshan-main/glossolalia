@@ -58,11 +58,12 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     try:
+        import patches  # noqa: F401 — installs F5TTS.load_lora (DECISIONS.md "F5-TTS LoRA path = DIY PEFT")
         from f5_tts.api import F5TTS
     except ImportError:
         print("install f5-tts before running the sweep.", file=sys.stderr); sys.exit(1)
     tts = F5TTS(model=args.model)
-    tts.load_lora(args.lora) if hasattr(tts, "load_lora") else None  # some forks expose this; otherwise patched in notebook
+    tts.load_lora(args.lora)
 
     rows = []
     total = len(sentences) * len(voices) * args.levels * len(seeds)

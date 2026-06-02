@@ -42,6 +42,7 @@ class TTSEngine:
         if self._tts is not None:
             return
         try:
+            import patches  # noqa: F401 — installs F5TTS.load_lora before instantiation
             from f5_tts.api import F5TTS
             self._tts = F5TTS(model="F5TTS_v1_Base")
             self.live = True
