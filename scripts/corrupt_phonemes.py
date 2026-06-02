@@ -58,6 +58,14 @@ def g2p_tokens(sentence: str):
     """Returns the raw g2p_en token stream (interleaved phonemes + spaces/punctuation)."""
     global _G2P
     if _G2P is None:
+        # g2p_en uses NLTK's pos_tag which (since NLTK 3.9) wants the *_eng suffixed taggers,
+        # but g2p_en's own bootstrap still references the legacy names. Pre-fetch both quietly.
+        import nltk
+        for res in ("averaged_perceptron_tagger_eng", "averaged_perceptron_tagger", "cmudict"):
+            try:
+                nltk.download(res, quiet=True)
+            except Exception:
+                pass
         from g2p_en import G2p
         _G2P = G2p()
     return [t for t in _G2P(sentence) if t != ""]
