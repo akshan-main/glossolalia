@@ -1,6 +1,6 @@
-# The Un-Language Slider — Field Notes
+# Glossolalia Dial — Field Notes
 
-*A dial that turns any sentence, in any voice, into wordless tongues. Built for HuggingFace + Gradio's Build Small Hackathon, Thousand Token Wood track.*
+*A dial that turns any sentence, in any voice, into wordless tongues — graded clean to glossolalia on one fine-tuned control token. Built for HuggingFace + Gradio's Build Small Hackathon, Thousand Token Wood track.*
 
 ---
 
