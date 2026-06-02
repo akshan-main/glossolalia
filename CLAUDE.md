@@ -2,9 +2,9 @@
 
 This directory is the user's entry to HuggingFace + Gradio's **Build Small Hackathon**, track 🍄 **Thousand Token Wood**. Submissions close **2026-06-15**.
 
-## Project: The Un-Language Slider
+## Project: Glossolalia Dial
 
-**One-line premise:** a single dial that grades a typed sentence from intelligible speech to phonotactically-valid English-native glossolalia — in the same voice — using one fine-tuned LoRA control token.
+**One-line premise:** a single dial that grades a typed sentence from intelligible speech to phonotactically-valid English-native glossolalia — in the same voice — using one fine-tuned LoRA control token. (Earlier internal name during scoping: "The Un-Language Slider." Kept as a poetic subtitle only; the canonical product name is "Glossolalia Dial," which matches the HF Space, model, dataset, and GitHub repo.)
 
 You type *"I had a dream last night about the ocean."* Pick a voice. The slider goes 0 → 4. At 0 you hear it spoken cleanly. At 2 you hear it half-dissolved ("I hade dremlas nigh abou the oshen…"). At 4 you hear it as wordless tongues that *sound* like a real language but aren't ("kah leh nah doh seh meh nah"), still recognizably the same speaker. A **Morph** button sweeps 0 → 4 across one continuous take. A small post-FX bus (reverb + chorus + octave layer) keeps the dry TTS from sounding like a phone call.
 
@@ -89,3 +89,15 @@ IDEA-AUDIT.md                   # killed concepts + research verdicts (provenanc
 - **Toy framing, not product framing.** Optimize for surprise + show-a-friend in 30s, not for breadth.
 - Persist project context here in CLAUDE.md, not in `memory/project_*.md`.
 - Minimal commit messages, never mention Claude/Anthropic/tests.
+
+## Working discipline — pre-move research, post-move audit, decisions log
+
+This project is being judged against world-class competition with a real cash + GPU prize pool. Slop loses. Every load-bearing move follows this loop:
+
+1. **Pre-move research (workflow).** Before any substantive design or technical change — new feature, framing pivot, model choice, data pipeline alteration, scope shift — run a `Workflow` first. Independent agents gather sources, adversarial verifiers refute weak claims, the synthesis produces a citable verdict. No vibes-based design. If the verdict is "don't do this," don't do it.
+2. **Make the move.** Implement against the verified plan, not against intuition.
+3. **Post-move audit (workflow).** After committing a non-trivial change, run an audit `Workflow` covering: regressions in the existing pipeline, consistency with stated decisions, compliance with hackathon rules, internal contradiction between code / docs / decisions log. Fix what it finds before the next move.
+4. **Decisions log.** Every load-bearing choice gets a `DECISIONS.md` entry with: the choice, what was rejected, the *why* (one paragraph), the cited sources, and the workflow that produced the verdict. A claim without a verified citation is not a claim — it's a guess we haven't done yet. The writeup (`BLOG.md`, demo voiceover, social post) cites the *actual* sources, not paraphrased authority.
+5. **Mechanical edits skip the loop.** Typo fixes, file renames, dependency bumps, formatter passes — just do them. The loop is for moves a judge could plausibly ask "why this and not X" about.
+
+This discipline is the difference between "nice toy" and "this person did proper work." Make every key decision in the demo video / BLOG.md / Q&A back to a verified source. Specifically: when explaining the LM rebias, cite the actual Goodman 1972 / Samarin 1972 / Hopelandic findings — not "we picked dreamy phonemes." The audience that knows the difference is exactly the audience the prizes come from.

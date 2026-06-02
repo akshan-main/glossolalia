@@ -450,11 +450,11 @@ KNOB_JS = """
 }
 """
 
-with gr.Blocks(title="The Un-Language Slider") as demo:
+with gr.Blocks(title="Glossolalia Dial") as demo:
     gr.HTML(
         """
         <div id="hero">
-            <h1>THE UN-LANGUAGE SLIDER</h1>
+            <h1>GLOSSOLALIA</h1>
             <p class="tagline">Type a sentence. Pick a voice. Turn the dial.<br>
             Hear it dissolve from speech to wordless tongues — in the same voice.</p>
             <div class="accent-line"></div>
