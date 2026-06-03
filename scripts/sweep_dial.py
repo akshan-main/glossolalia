@@ -82,10 +82,12 @@ def main():
                 for sd in seeds:
                     name = f"{voice['id']}_lv{lv}_s{sd}_s{si}"
                     wav_p = out / f"{name}.wav"
-                    prompt = f"{sentence} | {args.stem} {LEVEL_WORDS[lv]}"
+                    # Level conditions via DiT side input (set_dial), not via gen_text.
+                    # gen_text stays the plain sentence; F5-TTS reads only that.
                     try:
+                        tts.set_dial(lv)
                         tts.infer(ref_file=voice["wav"], ref_text=voice["ref_text"],
-                                  gen_text=prompt, file_wave=str(wav_p), seed=sd)
+                                  gen_text=sentence, file_wave=str(wav_p), seed=sd)
                     except Exception as e:
                         print(f"  fail {name}: {e}", file=sys.stderr); continue
                     rows.append({"name": name, "wav": str(wav_p), "sentence": sentence,
