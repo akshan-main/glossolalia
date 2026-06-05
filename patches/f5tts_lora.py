@@ -65,10 +65,11 @@ def _install_v5_patch(base_dit, level_embed):
         t = self.time_embed(time)
         sc = getattr(self, "_current_scalars", None)
         if sc is not None:
-            s = sc.to(device=t.device, dtype=t.dtype).view(-1, 1)
+            le_dtype = next(self.level_embed.parameters()).dtype
+            s = sc.to(device=t.device, dtype=le_dtype).view(-1, 1)
             if s.shape[0] == 1 and t.shape[0] > 1:
                 s = s.expand(t.shape[0], 1)
-            t = t + self.level_embed(s)
+            t = t + self.level_embed(s).to(t.dtype)
         seq_len = x.shape[1]
         if cfg_infer:
             x_c = self.get_input_embed(x, cond, text, drop_audio_cond=False,
