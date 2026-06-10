@@ -24,13 +24,13 @@ image = (
     .pip_install(
         "torch==2.5.0",
         "torchaudio==2.5.0",
+        # transformers >= 4.55 uses torch.float8_e8m0fnu (needs torch >= 2.6).
+        # Pin to a version that works with torch 2.5.
+        "transformers==4.46.3",
         "f5-tts",
-        "peft>=0.14.0",
-        # NOTE: NO torchao. torchao>=0.16 needs torch>=2.11 (uses torch.int1),
-        # torchao<0.16 has its own issues with peft 0.14. Skip it on this image —
-        # peft works without it as long as we don't use quantized models. The Colab
-        # need for torchao was a different version-conflict trap that doesn't apply
-        # to a clean Modal Debian build.
+        "peft>=0.14.0,<0.16.0",  # peft 0.16+ may also require newer torch
+        # NO torchao: torchao>=0.16 needs torch>=2.11 (uses torch.int1).
+        # peft works without it as long as we don't use quantized models.
         "soundfile",
         "librosa",
         "scipy",
