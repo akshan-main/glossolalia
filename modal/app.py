@@ -198,7 +198,10 @@ def train_v5():
         def forward(self, s):
             return self.net(s)
 
-    level_embed = LevelEmbed(DIM).to(device=device, dtype=model_dtype)
+    # CRITICAL: level_embed stays in fp32 to escape bf16 mantissa-epsilon kill.
+    # bf16 epsilon ~7.8e-3 vs |t| ~ O(1-10): zero-init outputs (steps 0-30) round away.
+    # See audit C12 in workflow w49ptme7h.
+    level_embed = LevelEmbed(DIM).to(device=device)  # fp32
     for p in level_embed.parameters():
         p.requires_grad_(True)
     dit.add_module("level_embed", level_embed)
@@ -213,10 +216,13 @@ def train_v5():
         t = self.time_embed(time)
         sc = getattr(self, "_current_scalars", None)
         if sc is not None:
-            s = sc.to(device=t.device, dtype=t.dtype).view(-1, 1)
+            orig_dtype = t.dtype
+            s = sc.to(device=t.device, dtype=torch.float32).view(-1, 1)
             if s.shape[0] == 1 and t.shape[0] > 1:
                 s = s.expand(t.shape[0], 1)
-            t = t + self.level_embed(s).to(t.dtype)
+            # Force fp32 math so the small zero-init level shift doesn't get rounded away in bf16.
+            with torch.amp.autocast("cuda", enabled=False):
+                t = (t.float() + self.level_embed(s)).to(orig_dtype)
         seq_len = x.shape[1]
         if cfg_infer:
             x_c = self.get_input_embed(x, cond, text, drop_audio_cond=False,
@@ -252,6 +258,8 @@ def train_v5():
     cfm.transformer = get_peft_model(dit, lora_cfg).to(device)
     base_dit = cfm.transformer.base_model.model
     assert hasattr(base_dit, "level_embed"), "level_embed lost on PEFT wrap"
+    assert base_dit is dit, "PEFT deep-copied the base model; patched forward lost"
+    assert base_dit.forward.__func__ is _patched_forward, "patched forward overridden"
 
     LV_RE = re.compile(r"_lv(\d)\.wav$")
     TONGUES_RE = re.compile(r"\s*\|\s*tongues\s+\w+\s*$", re.IGNORECASE)
@@ -318,20 +326,23 @@ def train_v5():
     print(f"  dataset rows: {len(ds)}, batches/epoch: {len(dl)}")
     assert len(ds) > 0
 
-    lora_params = [p for n, p in cfm.named_parameters()
-                   if p.requires_grad and "level_embed" not in n]
+    # Identity-based exclusion (substring filter is brittle if PEFT renames anything)
+    level_param_ids = {id(p) for p in level_embed.parameters()}
+    lora_params = [p for _, p in cfm.named_parameters()
+                   if p.requires_grad and id(p) not in level_param_ids]
     level_params = list(level_embed.parameters())
     for p in level_params:
         p.requires_grad_(True)
     print(f"  LoRA params : {sum(p.numel() for p in lora_params):,}")
     print(f"  Level params: {sum(p.numel() for p in level_params):,}")
 
+    # eps=1e-8 since level params now fp32 (was 1e-6 for bf16 safety)
     opt = torch.optim.AdamW(
         [
             {"params": lora_params, "lr": LR_LORA},
             {"params": level_params, "lr": LEVEL_LR},
         ],
-        betas=(0.9, 0.99), weight_decay=0.0, eps=1e-6,
+        betas=(0.9, 0.99), weight_decay=0.0, eps=1e-8,
     )
 
     def clear_text_cache(d):
@@ -359,13 +370,15 @@ def train_v5():
             opt.step()
             base_dit._current_scalars = None
             clear_text_cache(base_dit)
-            if step % 10 == 0:
+            # Print at steps 1, 5, then every 10 — early-detect a dead dial in the first minute
+            if step in (1, 5) or step % 10 == 0:
                 with torch.no_grad():
+                    # fp32 probe — level_embed is fp32 now
                     probe = torch.tensor([[0.0], [0.25], [0.5], [0.75], [1.0]],
-                                         device=device, dtype=model_dtype)
+                                         device=device, dtype=torch.float32)
                     norms = level_embed(probe).norm(dim=-1).tolist()
                 print(f"  ep{ep} step{step:4d} loss={loss.item():.4f} "
-                      f"lvl_norms={[f'{x:.2f}' for x in norms]} "
+                      f"lvl_norms={[f'{x:.3f}' for x in norms]} "
                       f"elapsed={time.time() - t0:.0f}s")
             step += 1
 
