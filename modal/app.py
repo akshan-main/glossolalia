@@ -6,13 +6,17 @@ modules_to_save quirks — level_embed attached directly to DiT, optimized as a 
 param group).
 
 Run:
-    modal run modal/app.py
+    modal run modal/app.py                  # full pipeline (~50 min, ~$2.50)
+    modal run modal/app.py::dry_run         # 30s sanity check (~$0.05) — DO THIS FIRST
+    modal run modal/app.py::sweep_and_verify  # re-sweep with existing adapter
 
-Cost: ~$2.50 (A100-40GB at ~$2.10/hr, ~50 min wall-clock for full micro-spike).
+Architecture: see DECISIONS.md "v5 AdaLN-side level conditioning".
 """
 import modal
 
 APP_NAME = "glossolalia-dial-v5"
+REPO_URL = "https://github.com/akshan-main/glossolalia.git"
+REPO_DIR = "/root/repo"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -36,59 +40,85 @@ image = (
         "cached_path",
     )
     .run_commands(
-        # Pre-download NLTK assets so first-run doesn't pay the cost
+        # Pre-download NLTK assets — caches into image
         "python -c \"import nltk; "
         "nltk.download('averaged_perceptron_tagger_eng', quiet=True); "
         "nltk.download('averaged_perceptron_tagger', quiet=True); "
         "nltk.download('cmudict', quiet=True)\""
     )
-    .run_commands(
-        # Clone the repo into the image so scripts/ + patches/ are available
-        "git clone -q https://github.com/akshan-main/glossolalia.git /root/repo",
-    )
+    # NOTE: no git clone here. Docker would cache it and lose later commits.
+    # Each function clones fresh at runtime.
 )
 
-# Persistent volume so corpus + trained adapter survive between runs.
 vol = modal.Volume.from_name("glossolalia-v5", create_if_missing=True)
-
 app = modal.App(APP_NAME, image=image)
+
+
+def _setup_repo():
+    """Clone (or pull) the repo at runtime. Called at the top of every function."""
+    import os, subprocess
+    if not os.path.isdir(REPO_DIR):
+        subprocess.check_call(["git", "clone", "-q", REPO_URL, REPO_DIR])
+    else:
+        subprocess.check_call(["git", "-C", REPO_DIR, "pull", "-q", "origin", "main"])
+    import sys
+    sys.path.insert(0, REPO_DIR)
+
+
+@app.function(gpu="A100-40GB", timeout=60 * 2)
+def dry_run():
+    """30-second sanity check: GPU works, F5-TTS imports, repo clones. Costs ~$0.05."""
+    import torch
+    _setup_repo()
+    print(f"  torch: {torch.__version__} | cuda: {torch.cuda.is_available()}")
+    print(f"  device: {torch.cuda.get_device_name(0)}")
+    from f5_tts.api import F5TTS
+    from peft import LoraConfig
+    import patches  # repo's patches/__init__.py
+    print("  f5_tts + peft + patches all import OK")
+    print("  dry_run PASS")
 
 
 @app.function(
     gpu="A100-40GB",
     volumes={"/vol": vol},
-    timeout=60 * 60,  # 1h
-    secrets=[modal.Secret.from_name("huggingface-token")],
+    timeout=60 * 60,
 )
 def pull_and_generate():
-    """Pull data from HF + generate the 200-clip training corpus (idempotent)."""
-    import os, shutil, subprocess, sys
-    sys.path.insert(0, "/root/repo")
+    """Pull data from HF + generate 200-clip training corpus. Idempotent (caches to volume)."""
+    import os, shutil, subprocess
+    _setup_repo()
 
-    # Pull data inputs
+    # Stage data inputs (small files, fine to re-pull each run)
     from huggingface_hub import snapshot_download
     p = snapshot_download(
         repo_id="akshan-main/glossolalia-inputs",
         repo_type="dataset",
-        local_dir="/root/repo/data_pull",
+        local_dir=f"{REPO_DIR}/data_pull",
     )
-    os.makedirs("/root/repo/data/voices", exist_ok=True)
+    os.makedirs(f"{REPO_DIR}/data/voices", exist_ok=True)
     for f in ("sentences.txt", "phoneme_lm.npz", "cmudict.dict"):
         s = os.path.join(p, f)
         if os.path.exists(s):
-            shutil.copy(s, f"/root/repo/data/{f}")
+            shutil.copy(s, f"{REPO_DIR}/data/{f}")
     vd = os.path.join(p, "voices")
     if os.path.isdir(vd):
         for f in os.listdir(vd):
-            shutil.copy(os.path.join(vd, f), f"/root/repo/data/voices/{f}")
-    print("  sentences:", sum(1 for _ in open("/root/repo/data/sentences.txt")))
+            shutil.copy(os.path.join(vd, f), f"{REPO_DIR}/data/voices/{f}")
+    print("  sentences:", sum(1 for _ in open(f"{REPO_DIR}/data/sentences.txt")))
+
+    # Mirror voices to volume so sweep_and_verify can read them
+    os.makedirs("/vol/voices", exist_ok=True)
+    for f in os.listdir(f"{REPO_DIR}/data/voices"):
+        shutil.copy(f"{REPO_DIR}/data/voices/{f}", f"/vol/voices/{f}")
 
     # Generate corpus (cached on volume — skip if already done)
     if os.path.isdir("/vol/coherence_ds") and os.path.exists("/vol/coherence_ds/metadata.csv"):
         print("  corpus already on volume, skipping generation")
+        vol.commit()
         return
 
-    os.chdir("/root/repo")
+    os.chdir(REPO_DIR)
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
@@ -105,10 +135,8 @@ def pull_and_generate():
         "--data", "data/coherence",
         "--out", "data/coherence_ds",
     ])
-    # Copy artifacts to volume
-    shutil.copytree("/root/repo/data/coherence", "/vol/coherence", dirs_exist_ok=True)
-    shutil.copytree("/root/repo/data/coherence_ds", "/vol/coherence_ds", dirs_exist_ok=True)
-    shutil.copytree("/root/repo/data/voices", "/vol/voices", dirs_exist_ok=True)
+    shutil.copytree(f"{REPO_DIR}/data/coherence", "/vol/coherence", dirs_exist_ok=True)
+    shutil.copytree(f"{REPO_DIR}/data/coherence_ds", "/vol/coherence_ds", dirs_exist_ok=True)
     vol.commit()
     print("  corpus saved to volume")
 
@@ -119,10 +147,10 @@ def pull_and_generate():
     timeout=60 * 60,
 )
 def train_v5():
-    """Train the v5 dial: LoRA on attention + attn_norm.linear, plus LevelEmbed MLP added to t."""
-    import os, re, json, time, types, sys
+    """Train v5: LoRA on attention + attn_norm.linear, plus LevelEmbed MLP added to t."""
+    import os, re, json, time, types
     from pathlib import Path
-    sys.path.insert(0, "/root/repo")
+    _setup_repo()
 
     import torch
     import torch.nn as nn
@@ -134,23 +162,18 @@ def train_v5():
     from peft import LoraConfig, get_peft_model
     from safetensors.torch import save_file
 
-    # Hyperparameters (from workflow synthesis)
     NUM_LEVELS = 5
     DIM = 1024
     BATCH = 4
     EPOCHS = 6
     LR_LORA = 1e-4
     LEVEL_LR = 5e-4
-    LORA_R = 16
-    LORA_ALPHA = 16
     SEED = 42
     OUT_DIR = "/vol/v5_adapter"
     os.makedirs(OUT_DIR, exist_ok=True)
-
     torch.manual_seed(SEED)
     device = "cuda"
 
-    # 1. Build base F5-TTS (will load checkpoint into ema_model)
     f5 = F5TTS(model="F5TTS_v1_Base")
     cfm = f5.ema_model
     dit = cfm.transformer
@@ -158,11 +181,9 @@ def train_v5():
     model_dtype = next(dit.parameters()).dtype
     print(f"  base DiT dtype: {model_dtype}")
 
-    # Freeze everything
     for p in cfm.parameters():
         p.requires_grad_(False)
 
-    # 2. LevelEmbed MLP — same dtype as base, plain nn.Module (NOT a PEFT module_to_save)
     class LevelEmbed(nn.Module):
         def __init__(self, dim):
             super().__init__()
@@ -183,7 +204,6 @@ def train_v5():
     dit.add_module("level_embed", level_embed)
     dit._current_scalars = None
 
-    # 3. Patch DiT.forward to add level_embed(scalar) to t after time_embed
     def _patched_forward(self, x, cond, text, time, mask=None,
                          drop_audio_cond=False, drop_text=False,
                          cfg_infer=False, cache=False):
@@ -196,7 +216,6 @@ def train_v5():
             s = sc.to(device=t.device, dtype=t.dtype).view(-1, 1)
             if s.shape[0] == 1 and t.shape[0] > 1:
                 s = s.expand(t.shape[0], 1)
-            # explicit dtype cast on output (level_embed params match t dtype already)
             t = t + self.level_embed(s).to(t.dtype)
         seq_len = x.shape[1]
         if cfg_infer:
@@ -226,17 +245,14 @@ def train_v5():
 
     dit.forward = types.MethodType(_patched_forward, dit)
 
-    # 4. PEFT-wrap with LoRA on attention + attn_norm.linear (the AdaLN projector).
-    # level_embed is NOT in modules_to_save — we manage it manually.
     lora_cfg = LoraConfig(
-        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=0.0, bias="none",
+        r=16, lora_alpha=16, lora_dropout=0.0, bias="none",
         target_modules=["to_q", "to_k", "to_v", "to_out.0", "attn_norm.linear"],
     )
     cfm.transformer = get_peft_model(dit, lora_cfg).to(device)
     base_dit = cfm.transformer.base_model.model
     assert hasattr(base_dit, "level_embed"), "level_embed lost on PEFT wrap"
 
-    # 5. Dataset (same as v4)
     LV_RE = re.compile(r"_lv(\d)\.wav$")
     TONGUES_RE = re.compile(r"\s*\|\s*tongues\s+\w+\s*$", re.IGNORECASE)
 
@@ -296,13 +312,12 @@ def train_v5():
             "scalars": torch.tensor([b["scalar"] for b in batch], dtype=torch.float32),
         }
 
-    csv_path = "/vol/coherence_ds/metadata.csv"
-    ds = CoherenceDS(csv_path)
+    ds = CoherenceDS("/vol/coherence_ds/metadata.csv")
     dl = DataLoader(ds, batch_size=BATCH, shuffle=True, collate_fn=collate,
                     num_workers=2, drop_last=True)
     print(f"  dataset rows: {len(ds)}, batches/epoch: {len(dl)}")
+    assert len(ds) > 0
 
-    # 6. Optimizer — split groups
     lora_params = [p for n, p in cfm.named_parameters()
                    if p.requires_grad and "level_embed" not in n]
     level_params = list(level_embed.parameters())
@@ -323,7 +338,6 @@ def train_v5():
         d.text_cond = None
         d.text_uncond = None
 
-    # 7. Training loop
     cfm.train()
     step = 0
     t0 = time.time()
@@ -355,7 +369,6 @@ def train_v5():
                       f"elapsed={time.time() - t0:.0f}s")
             step += 1
 
-    # 8. Save adapter + level_to_time
     cfm.transformer.save_pretrained(OUT_DIR, safe_serialization=True)
     le_state = {f"net.{k}": v.detach().cpu().contiguous()
                 for k, v in level_embed.net.state_dict().items()}
@@ -368,7 +381,6 @@ def train_v5():
     vol.commit()
     print(f"\nsaved adapter + level_to_time -> {OUT_DIR}")
     print("  files:", sorted(os.listdir(OUT_DIR)))
-    return OUT_DIR
 
 
 @app.function(
@@ -377,10 +389,11 @@ def train_v5():
     timeout=60 * 60,
 )
 def sweep_and_verify():
-    """Sweep dial 0..4 on 3 holdout sentences, run spectral diff between dial=0 and dial=4."""
-    import os, sys, glob, numpy as np, soundfile as sf
+    """Sweep dial 0..4 on 3 holdout sentences, spectral diff between dial=0 and dial=4."""
+    import os, numpy as np, soundfile as sf
     from scipy.signal import stft
-    sys.path.insert(0, "/root/repo")
+    _setup_repo()
+
     import patches  # installs F5TTS.load_lora + set_dial
     from f5_tts.api import F5TTS
 
@@ -411,7 +424,6 @@ def sweep_and_verify():
             )
     vol.commit()
 
-    # Spectral diff
     def spec_diff(wa, wb, n_fft=1024, hop=256):
         y1, sr = sf.read(wa)
         y2, _ = sf.read(wb)
@@ -434,22 +446,21 @@ def sweep_and_verify():
             wa = os.path.join(SWEEP, f"v1_lv{pair[0]}_s{si}.wav")
             wb = os.path.join(SWEEP, f"v1_lv{pair[1]}_s{si}.wav")
             d = spec_diff(wa, wb)
-            audible = "AUDIBLE" if d["logmag_corr"] < 0.85 else "near-identical"
+            verdict = "AUDIBLE" if d["logmag_corr"] < 0.85 else "near-identical"
             if d["logmag_corr"] < 0.85:
                 n_audible += 1
             print(f"  s{si} lv{pair[0]} vs lv{pair[1]}: corr={d['logmag_corr']:.4f} "
-                  f"mae={d['logmag_mae']:.4f} -> {audible}")
+                  f"mae={d['logmag_mae']:.4f} -> {verdict}")
     print(f"\n  audible pairs: {n_audible}/9")
     print(f"  gate (>=4 audible to pass): {'PASS' if n_audible >= 4 else 'FAIL'}")
 
 
 @app.local_entrypoint()
 def main():
-    """Run the full pipeline locally-driven, on Modal-managed A100s."""
     print(">> step 1: pull data + generate corpus")
     pull_and_generate.remote()
     print("\n>> step 2: train v5")
     train_v5.remote()
     print("\n>> step 3: sweep + spectral verify")
     sweep_and_verify.remote()
-    print("\n>> done. Check Modal dashboard for live logs; adapter on volume at /vol/v5_adapter")
+    print("\n>> done. Adapter on volume at /vol/v5_adapter")
