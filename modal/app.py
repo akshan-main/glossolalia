@@ -69,7 +69,7 @@ def _setup_repo():
     sys.path.insert(0, REPO_DIR)
 
 
-@app.function(gpu="A10G", timeout=60 * 2)
+@app.function(gpu="A100-40GB", timeout=60 * 2)
 def dry_run():
     """30-second sanity check: GPU works, F5-TTS imports, repo clones. Costs ~$0.05."""
     import torch
@@ -84,7 +84,7 @@ def dry_run():
 
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-40GB",
     volumes={"/vol": vol},
     timeout=60 * 60,
 )
@@ -146,7 +146,7 @@ def pull_and_generate():
 
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-40GB",
     volumes={"/vol": vol},
     timeout=60 * 60,
 )
@@ -401,7 +401,7 @@ def train_v5():
 
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-40GB",
     volumes={"/vol": vol},
     timeout=60 * 60,
 )
