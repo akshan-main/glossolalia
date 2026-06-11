@@ -257,14 +257,13 @@ def train_v5():
 
     dit.forward = types.MethodType(_patched_forward, dit)
 
-    # v6 LoRA config: Sliders defaults (r=4 alpha=1, alpha/r=0.25). Low-rank IS the
-    # disentanglement constraint per Concept Sliders ECCV 2024 §3.2 (interference 0.10
-    # low-rank vs 0.19 unconstrained). Dropping attn_norm.linear from targets — F5-TTS
-    # PEFT precedent (Kwon Interspeech 2025) adapts text-embed + post-concat-linear, NOT
-    # per-block AdaLN; adapting AdaLN here lets attention bypass the level scalar entirely.
+    # v7 LoRA config: revert v6's capacity strip (0/9 audible vs v5's 4/9) — empirically
+    # the attn_norm.linear surface was load-bearing on supervised-regression scalar
+    # control, contrary to Sliders' contrastive-pair recipe. Keep v5's r=16 alpha=16 +
+    # attn_norm.linear targets, with v6's 40-epoch / 2e-4 LR_LORA / 2e-3 LEVEL_LR.
     lora_cfg = LoraConfig(
-        r=4, lora_alpha=1, lora_dropout=0.0, bias="none",
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        r=16, lora_alpha=16, lora_dropout=0.0, bias="none",
+        target_modules=["to_q", "to_k", "to_v", "to_out.0", "attn_norm.linear"],
     )
     cfm.transformer = get_peft_model(dit, lora_cfg).to(device)
     base_dit = cfm.transformer.base_model.model
