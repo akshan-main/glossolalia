@@ -169,9 +169,11 @@ def train_v5():
     NUM_LEVELS = 5
     DIM = 1024
     BATCH = 4
-    EPOCHS = 6
-    LR_LORA = 1e-4
-    LEVEL_LR = 5e-4
+    # v6 recipe (deep-research wf_ccca9848): Sliders-validated baseline + zero-init-escape.
+    # 200 clips / batch 4 = 50 steps/epoch. 40 epochs = 2000 steps, ~Sliders' 1000 floor x 2.
+    EPOCHS = 40
+    LR_LORA = 2e-4     # Sliders config.yaml: AdamW 2e-4 bf16
+    LEVEL_LR = 2e-3    # 10x LR_LORA: empirical, give zero-init MLP a chance to escape origin
     SEED = 42
     OUT_DIR = "/vol/v5_adapter"
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -255,9 +257,14 @@ def train_v5():
 
     dit.forward = types.MethodType(_patched_forward, dit)
 
+    # v6 LoRA config: Sliders defaults (r=4 alpha=1, alpha/r=0.25). Low-rank IS the
+    # disentanglement constraint per Concept Sliders ECCV 2024 §3.2 (interference 0.10
+    # low-rank vs 0.19 unconstrained). Dropping attn_norm.linear from targets — F5-TTS
+    # PEFT precedent (Kwon Interspeech 2025) adapts text-embed + post-concat-linear, NOT
+    # per-block AdaLN; adapting AdaLN here lets attention bypass the level scalar entirely.
     lora_cfg = LoraConfig(
-        r=16, lora_alpha=16, lora_dropout=0.0, bias="none",
-        target_modules=["to_q", "to_k", "to_v", "to_out.0", "attn_norm.linear"],
+        r=4, lora_alpha=1, lora_dropout=0.0, bias="none",
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
     )
     cfm.transformer = get_peft_model(dit, lora_cfg).to(device)
     base_dit = cfm.transformer.base_model.model
@@ -353,6 +360,9 @@ def train_v5():
         d.text_cond = None
         d.text_uncond = None
 
+    # Per-level loss accumulator (deep-research diag: if flat across levels => dial dead)
+    per_level_loss = {i: [] for i in range(NUM_LEVELS)}
+
     cfm.train()
     step = 0
     t0 = time.time()
@@ -370,19 +380,37 @@ def train_v5():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 loss, _, _ = cfm(mel, text=batch["text"], lens=mel_lens)
             loss.backward()
+            # Diag: grad-norm RATIO before clipping. If LoRA grad >> level grad after
+            # warmup, the attention pathway is starving the zero-init gate (deep-research
+            # finding #3: zero-init gates lose gradient races to competing pathways).
+            with torch.no_grad():
+                gn_lora = torch.norm(torch.stack([p.grad.norm() for p in lora_params if p.grad is not None]))
+                gn_level = torch.norm(torch.stack([p.grad.norm() for p in level_params if p.grad is not None]))
             torch.nn.utils.clip_grad_norm_(lora_params + level_params, 1.0)
             opt.step()
+            # Track per-level loss bucket
+            for s_val, _ in zip(scalars.tolist(), [None] * len(scalars)):
+                lvl = int(round(s_val * (NUM_LEVELS - 1)))
+                per_level_loss[lvl].append(float(loss.item()))
             base_dit._current_scalars = None
             clear_text_cache(base_dit)
-            # Print at steps 1, 5, then every 10 — early-detect a dead dial in the first minute
-            if step in (1, 5) or step % 10 == 0:
+            # Print at steps 1, 5, then every 25 — log per-level loss + grad ratio
+            if step in (1, 5) or step % 25 == 0:
                 with torch.no_grad():
-                    # fp32 probe — level_embed is fp32 now
                     probe = torch.tensor([[0.0], [0.25], [0.5], [0.75], [1.0]],
                                          device=device, dtype=torch.float32)
                     norms = level_embed(probe).norm(dim=-1).tolist()
+                ratio = float(gn_lora / max(gn_level, torch.tensor(1e-9))) if gn_level > 0 else float('inf')
+                # Per-level recent mean (last 20 examples of each level)
+                pl_mean = {}
+                for lv in range(NUM_LEVELS):
+                    recent = per_level_loss[lv][-20:]
+                    pl_mean[lv] = sum(recent) / max(len(recent), 1)
+                pl_str = "|".join(f"{pl_mean[lv]:.3f}" for lv in range(NUM_LEVELS))
                 print(f"  ep{ep} step{step:4d} loss={loss.item():.4f} "
                       f"lvl_norms={[f'{x:.3f}' for x in norms]} "
+                      f"per_lv_loss=[{pl_str}] "
+                      f"grad_ratio(lora/lvl)={ratio:.2f} "
                       f"elapsed={time.time() - t0:.0f}s")
             step += 1
 
