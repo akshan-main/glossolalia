@@ -278,122 +278,213 @@ def morph(sentence: str, voice_id: str, postfx_preset: str, mode: str,
 # ----- CSS (dreamy pastel theme: half-remembered photograph of dusk) -----
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500&family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,700;1,9..144,300;1,9..144,400&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&family=IBM+Plex+Mono:wght@300;400;500&display=swap');
+
+/* DUSK — Vaughan-Oliver-leaning aesthetic. Warm dust palette, asymmetric editorial composition,
+   brass knob with vermillion arc as the focal ritual object. */
 
 :root {
-    --bg: #EFE6D8;
-    --bg-top: #B6BFD8;
-    --bg-mid: #D9A6A0;
-    --bg-bottom: #F2D6BD;
-    --surface: #F5ECDF;
-    --surface-soft: #EAD9C7;
-    --ink: #3C4266;
-    --ink-soft: #6B6E8A;
-    --ink-quiet: #8C8FA8;
-    --accent-rose: #D9A6A0;
-    --accent-sage: #A8B89A;
-    --accent-peach: #F2D6BD;
-    --accent-coral: #E78558;
-    --accent-wine: #503F52;
-    --halo-warm: #F4C7B0;
-    --halo-cool: #C8C4DE;
-    --hairline: rgba(60, 66, 102, 0.18);
+    --paper: #F2E6D2;
+    --paper-warm: #ECDABE;
+    --paper-deep: #D9B89A;
+    --ink: #2A1F2D;
+    --ink-soft: #5C4D52;
+    --ink-quiet: #8B7C7F;
+    --vermillion: #B7472A;
+    --vermillion-glow: rgba(183, 71, 42, 0.32);
+    --brass: #A8884D;
+    --brass-light: #D6B888;
+    --brass-deep: #6B5328;
+    --hairline: rgba(42, 31, 45, 0.16);
+    --hairline-strong: rgba(42, 31, 45, 0.32);
 }
 
-body, .gradio-container, .dark, .light {
+html, body, .gradio-container, .dark, .light, gradio-app {
     background:
-      radial-gradient(1200px 800px at 20% 8%, rgba(244,199,176,0.55), transparent 60%),
-      linear-gradient(180deg, var(--bg-top) 0%, var(--bg-mid) 45%, var(--bg-bottom) 100%) !important;
+      radial-gradient(1200px 700px at 78% -8%, rgba(217,184,154,0.55), transparent 60%),
+      radial-gradient(900px 600px at 12% 110%, rgba(183, 71, 42, 0.10), transparent 65%),
+      linear-gradient(180deg, var(--paper) 0%, var(--paper-warm) 60%, var(--paper-deep) 120%) !important;
     background-attachment: fixed !important;
     color: var(--ink) !important;
-    font-family: 'EB Garamond', Georgia, serif !important;
+    font-family: 'Newsreader', Georgia, serif !important;
 }
 
-body::before {
+/* film grain veil */
+body::before, gradio-app::before {
     content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.235 0 0 0 0 0.258 0 0 0 0 0.4 0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
-    opacity: 0.14; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.92' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.16 0 0 0 0 0.12 0 0 0 0 0.18 0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    opacity: 0.18; mix-blend-mode: multiply;
 }
 
-.gradio-container { max-width: 880px !important; margin: 0 auto !important; padding: 72px 28px 96px !important; position: relative; z-index: 1; }
+.gradio-container { max-width: 760px !important; margin: 0 auto !important; padding: 88px 28px 120px !important; position: relative; z-index: 1; }
 
-#hero { text-align: center; margin-bottom: 44px; }
+/* -------------------- HERO -------------------- */
+
+#hero { text-align: left; margin-bottom: 64px; padding-bottom: 32px; border-bottom: 1px solid var(--hairline); position: relative; }
+#hero .eyebrow {
+    font-family: 'IBM Plex Mono', monospace; font-weight: 400; font-size: 11px;
+    color: var(--vermillion); letter-spacing: 0.34em; text-transform: uppercase;
+    margin-bottom: 18px;
+}
 #hero h1 {
     font-family: 'Fraunces', serif; font-variation-settings: 'opsz' 144, 'SOFT' 100;
-    font-style: italic; font-weight: 300; font-size: 76px;
-    letter-spacing: 0.04em; line-height: 1; margin: 0;
+    font-style: italic; font-weight: 300; font-size: 110px;
+    letter-spacing: -0.025em; line-height: 0.86; margin: 0;
     color: var(--ink); text-transform: lowercase;
+    text-shadow: 0 1px 0 rgba(255,255,255,0.18);
 }
+#hero h1 .dot { color: var(--vermillion); font-size: 0.45em; vertical-align: super; margin-left: 4px; }
 #hero .tagline {
-    font-family: 'EB Garamond', serif; font-style: italic; font-size: 18px;
-    color: var(--ink-soft); margin-top: 12px; max-width: 540px; margin-left: auto; margin-right: auto;
+    font-family: 'Newsreader', serif; font-style: italic; font-weight: 300; font-size: 19px;
+    color: var(--ink-soft); margin-top: 22px; max-width: 460px;
     line-height: 1.5;
 }
-#hero .accent-line { display: inline-block; width: 64px; height: 1px; background: var(--ink-soft); opacity: 0.5; margin: 20px 0 0; }
+#hero .meta {
+    position: absolute; right: 0; top: 0;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    color: var(--ink-quiet); letter-spacing: 0.18em; text-transform: uppercase;
+    text-align: right; line-height: 1.8;
+}
 
-label, .gr-form > label, span[data-testid="block-info"] {
+/* -------------------- COMPONENTS -------------------- */
+
+label, .gr-form > label, span[data-testid="block-info"], .label-wrap, label > span {
     color: var(--ink-soft) !important;
-    font-family: 'EB Garamond', serif !important;
-    font-style: italic !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-style: normal !important;
     font-weight: 400 !important;
-    font-size: 13px !important;
-    letter-spacing: 0.04em !important;
-    text-transform: lowercase !important;
+    font-size: 10px !important;
+    letter-spacing: 0.26em !important;
+    text-transform: uppercase !important;
 }
 
-input, textarea, select,
-.gr-input, .gr-text-input, .gr-dropdown, [role="listbox"],
-.gr-box, .block {
-    background: var(--surface) !important;
-    border: 1px solid var(--hairline) !important;
-    color: var(--ink) !important;
-    border-radius: 14px !important;
-    font-family: 'EB Garamond', serif !important;
-    font-size: 15px !important;
-}
-textarea, input[type="text"], input[type="number"] {
-    padding: 12px 14px !important;
-}
-input:focus, textarea:focus, select:focus { border-color: var(--accent-coral) !important; outline: none !important; box-shadow: 0 0 0 3px rgba(231,133,88,0.18) !important; }
-
-button.primary, button[variant="primary"], .primary > button, button.lg {
+/* textarea — magazine pull-quote */
+textarea.svelte-633qhp, textarea {
     background: transparent !important;
+    border: none !important;
+    border-bottom: 1px solid var(--hairline-strong) !important;
+    border-radius: 0 !important;
     color: var(--ink) !important;
-    border: 1px solid var(--ink-soft) !important;
-    padding: 12px 28px !important;
     font-family: 'Fraunces', serif !important;
     font-style: italic !important;
-    font-weight: 400 !important;
-    font-size: 16px !important;
+    font-weight: 300 !important;
+    font-size: 26px !important;
+    line-height: 1.35 !important;
+    padding: 14px 0 18px 0 !important;
+    box-shadow: none !important;
+    resize: none !important;
+}
+textarea::placeholder { color: var(--ink-quiet) !important; opacity: 0.5 !important; }
+textarea:focus { border-bottom-color: var(--vermillion) !important; outline: none !important; box-shadow: none !important; }
+
+/* other inputs - quieter, paper card */
+input, select, .gr-input, .gr-dropdown, [role="listbox"], .gr-box {
+    background: rgba(255, 248, 235, 0.55) !important;
+    backdrop-filter: blur(2px);
+    border: 1px solid var(--hairline) !important;
+    color: var(--ink) !important;
+    border-radius: 4px !important;
+    font-family: 'Newsreader', serif !important;
+    font-size: 15px !important;
+}
+input[type="text"], input[type="number"], select { padding: 10px 14px !important; }
+input:focus, select:focus { border-color: var(--vermillion) !important; outline: none !important; box-shadow: 0 0 0 3px var(--vermillion-glow) !important; }
+
+/* mode radio — hard-printed binary switch */
+.gr-form fieldset, .wrap.svelte-1mwvhlq, [role="radiogroup"] {
+    display: flex !important; gap: 0 !important;
+    border: 1px solid var(--ink) !important;
+    background: transparent !important;
+    border-radius: 4px !important;
+    padding: 0 !important;
+    overflow: hidden;
+}
+[role="radio"] label, label.gr-input-label, [data-testid="block-label"] + div > label {
+    background: transparent !important;
+    color: var(--ink) !important;
+    font-family: 'Fraunces', serif !important;
+    font-style: italic !important;
+    font-size: 15px !important;
+    padding: 8px 22px !important;
+    cursor: pointer !important;
+    border-right: 1px solid var(--hairline) !important;
+}
+[role="radio"][aria-checked="true"] label, label.gr-input-label.selected,
+input[type="radio"]:checked + label {
+    background: var(--ink) !important;
+    color: var(--paper) !important;
+}
+
+/* buttons — italic pill outlines */
+button.primary, button[variant="primary"], .primary > button, button.lg, .gr-button {
+    background: transparent !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--ink) !important;
+    padding: 12px 30px !important;
+    font-family: 'Fraunces', serif !important;
+    font-style: italic !important;
+    font-weight: 300 !important;
+    font-size: 17px !important;
+    letter-spacing: 0.01em !important;
     border-radius: 999px !important;
     box-shadow: none !important;
-    transition: background 0.18s, border-color 0.18s !important;
+    transition: background 0.22s, color 0.22s, transform 0.22s !important;
 }
-button.primary:hover, button[variant="primary"]:hover { background: rgba(60,66,102,0.06) !important; border-color: var(--ink) !important; }
+button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
+    background: var(--ink) !important; color: var(--paper) !important; transform: translateY(-1px);
+}
+button.primary:nth-of-type(2), .gr-row button:nth-of-type(2) { border-color: var(--vermillion) !important; color: var(--vermillion) !important; }
+button.primary:nth-of-type(2):hover, .gr-row button:nth-of-type(2):hover { background: var(--vermillion) !important; color: var(--paper) !important; }
 
-.gr-audio, audio { background: var(--surface) !important; border: 1px solid var(--hairline) !important; border-radius: 14px !important; }
+/* audio output */
+.gr-audio, audio {
+    background: rgba(255, 248, 235, 0.55) !important;
+    border: 1px solid var(--hairline) !important;
+    border-radius: 4px !important;
+}
 
-.readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-top: 18px; }
-.readout-cell { background: transparent; padding: 12px 8px; text-align: center; border-right: 1px solid var(--hairline); }
+/* readout — newspaper masthead row */
+.readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-top: 24px;
+           border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); padding: 14px 0; }
+.readout-cell { background: transparent; padding: 4px 12px; text-align: left; border-right: 1px solid var(--hairline); }
 .readout-cell:last-child { border-right: none; }
-.readout-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.18em; color: var(--ink-quiet); margin-bottom: 4px; text-transform: lowercase; }
-.readout-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; }
+.readout-label { font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.28em; color: var(--ink-quiet); margin-bottom: 6px; text-transform: uppercase; }
+.readout-val { font-family: 'Fraunces', serif; font-style: italic; font-size: 22px; font-weight: 400; color: var(--ink); letter-spacing: -0.01em; }
+
+/* ghost lyric readout */
+.ghost-lyric, .ghost-lyric textarea, [data-testid="textbox"]:not(:first-of-type) textarea {
+    font-family: 'Fraunces', serif !important;
+    font-style: italic !important;
+    font-size: 22px !important;
+    color: var(--vermillion) !important;
+    border: none !important;
+    border-left: 2px solid var(--vermillion) !important;
+    background: transparent !important;
+    padding: 10px 0 10px 20px !important;
+    border-radius: 0 !important;
+}
 
 #footer {
-    margin-top: 72px; padding-top: 24px;
+    margin-top: 96px; padding-top: 28px;
     border-top: 1px solid var(--hairline);
-    text-align: center;
-    font-family: 'EB Garamond', serif; font-style: italic;
-    font-size: 12px; color: var(--ink-quiet);
-    line-height: 1.6;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; color: var(--ink-quiet); letter-spacing: 0.22em;
+    text-transform: uppercase;
+    line-height: 1.8;
+    display: grid; grid-template-columns: 1fr auto; gap: 24px;
 }
 
 .dial-label { display: none; }
 .gr-slider, [data-testid="slider"] { display: none !important; }
 
+/* hide the standard gradio header / footer chrome */
+.show-api, footer.svelte-mpyp5e, gradio-app > footer { display: none !important; }
+
 @media (max-width: 720px) {
-    #hero h1 { font-size: 48px !important; }
-    .gradio-container { padding: 32px 16px !important; }
+    #hero h1 { font-size: 64px !important; }
+    #hero .meta { display: none; }
+    .gradio-container { padding: 40px 18px 64px !important; }
+    textarea { font-size: 22px !important; }
 }
 """
 
@@ -409,73 +500,117 @@ _THEME = gr.themes.Base(primary_hue=gr.themes.colors.pink, neutral_hue=gr.themes
 
 KNOB_HTML = """
 <style>
-  #dial-knob { padding: 4px 0 8px 0; }
-  .dial-label { color: var(--text-secondary); font-size: 12px; font-weight: 500;
-                text-transform: uppercase; letter-spacing: 0.08em;
-                font-family: 'JetBrains Mono', monospace; margin-bottom: 8px; }
-  .knob-host {
-    position: relative; width: 168px; height: 168px; margin: 4px auto 6px;
-    border-radius: 50%; cursor: grab;
-    background: radial-gradient(circle at 30% 30%, #1a1a26 0%, #0e0e16 70%, #08080d 100%);
+  #dial-knob { padding: 28px 0 12px 0; display: flex; flex-direction: column; align-items: center; }
+  .knob-stage {
+    position: relative; width: 280px; height: 280px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  /* outer brass ring */
+  .knob-stage::before {
+    content: ''; position: absolute; inset: 0; border-radius: 50%;
+    background: conic-gradient(from 0deg,
+      #B89968, #6B5328, #D6B888, #A8884D, #6B5328, #C6A468, #B89968);
+    filter: blur(0.5px);
+  }
+  .knob-stage::after {
+    content: ''; position: absolute; inset: 10px; border-radius: 50%;
+    background: var(--paper);
     box-shadow:
-      inset 0 0 0 1px var(--border),
-      inset 0 8px 24px rgba(0,0,0,0.6),
-      0 0 0 1px var(--border-bright),
-      0 0 32px rgba(255, 61, 146, 0.08);
-    touch-action: none; user-select: none; outline: none;
-    transition: box-shadow 0.18s;
+      inset 0 0 0 1px rgba(42,31,45,0.18),
+      0 18px 32px -16px rgba(42,31,45,0.42),
+      0 2px 0 rgba(255,255,255,0.6) inset;
+  }
+  .knob-host {
+    position: relative; z-index: 2; width: 192px; height: 192px;
+    border-radius: 50%; cursor: grab; outline: none;
+    background:
+      radial-gradient(circle at 32% 28%, #FFF1D8 0%, #E8C7A0 30%, #B89968 64%, #6B5328 96%);
+    box-shadow:
+      inset 0 -8px 18px rgba(42,31,45,0.32),
+      inset 0 2px 6px rgba(255,255,255,0.45),
+      0 6px 16px rgba(42,31,45,0.22);
+    touch-action: none; user-select: none;
+    transition: box-shadow 0.18s, filter 0.22s;
   }
   .knob-host:focus-visible, .knob-host.dragging {
     box-shadow:
-      inset 0 0 0 1px var(--accent),
-      inset 0 8px 24px rgba(0,0,0,0.6),
-      0 0 0 1px var(--accent),
-      0 0 48px var(--accent-glow);
+      inset 0 -8px 18px rgba(42,31,45,0.32),
+      inset 0 2px 6px rgba(255,255,255,0.55),
+      0 0 0 2px var(--vermillion),
+      0 8px 24px var(--vermillion-glow);
+    filter: saturate(1.08);
   }
   .knob-host.dragging { cursor: grabbing; }
+  /* vermillion arc */
   .knob-arc {
-    position: absolute; inset: -6px; border-radius: 50%; pointer-events: none;
+    position: absolute; z-index: 3; inset: -16px; border-radius: 50%; pointer-events: none;
     background: conic-gradient(
       from 225deg,
-      var(--accent) 0deg,
-      var(--accent) var(--arc-deg, 0deg),
+      var(--vermillion) 0deg,
+      var(--vermillion) var(--arc-deg, 0deg),
       transparent var(--arc-deg, 0deg) 270deg,
       transparent 360deg
     );
-    -webkit-mask: radial-gradient(circle, transparent 78px, #000 79px, #000 86px, transparent 87px);
-            mask: radial-gradient(circle, transparent 78px, #000 79px, #000 86px, transparent 87px);
-    filter: drop-shadow(0 0 6px var(--accent-glow));
+    -webkit-mask: radial-gradient(circle, transparent 116px, #000 117px, #000 124px, transparent 125px);
+            mask: radial-gradient(circle, transparent 116px, #000 117px, #000 124px, transparent 125px);
+    filter: drop-shadow(0 0 8px var(--vermillion-glow));
   }
+  /* indicator — a tiny vermillion bar with subtle glow */
   .knob-indicator {
-    position: absolute; left: 50%; top: 14px;
-    width: 3px; height: 24px; margin-left: -1.5px;
-    background: var(--accent); border-radius: 2px;
-    transform-origin: 50% 70px;
+    position: absolute; z-index: 4; left: 50%; top: 22px;
+    width: 4px; height: 28px; margin-left: -2px;
+    background: var(--vermillion); border-radius: 2px;
+    transform-origin: 50% 74px;
     transform: rotate(var(--knob-angle, -135deg));
-    box-shadow: 0 0 12px var(--accent-glow);
+    box-shadow: 0 0 12px var(--vermillion-glow);
     pointer-events: none;
-    transition: transform 0.12s cubic-bezier(.4,1.2,.4,1);
+    transition: transform 0.16s cubic-bezier(.34,1.36,.4,1);
   }
+  /* the center numeral — italic Fraunces in ink */
   .knob-label {
-    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    font-family: 'Space Grotesk', sans-serif; font-size: 56px; font-weight: 700;
-    color: var(--text-primary); letter-spacing: -0.03em; pointer-events: none;
+    position: absolute; z-index: 5; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Fraunces', serif; font-style: italic; font-weight: 300;
+    font-size: 92px; color: var(--ink);
+    letter-spacing: -0.04em; pointer-events: none;
+    text-shadow: 0 1px 0 rgba(255, 240, 220, 0.5), 0 -1px 0 rgba(42, 31, 45, 0.12);
   }
+  /* ticks — italic editorial numerals around the knob */
   .knob-ticks {
-    display: flex; justify-content: space-between; width: 220px; margin: 8px auto 0;
-    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted);
-    letter-spacing: 0.1em;
+    display: flex; justify-content: space-between; width: 320px; margin: 28px auto 0;
+    font-family: 'Fraunces', serif; font-style: italic; font-weight: 300;
+    font-size: 14px; color: var(--ink-quiet);
+    padding: 0 18px;
   }
-  .knob-ticks span.active { color: var(--accent); }
+  .knob-ticks span {
+    display: inline-flex; flex-direction: column; align-items: center; gap: 4px;
+    cursor: pointer; transition: color 0.18s;
+  }
+  .knob-ticks span::before {
+    content: ''; width: 1px; height: 8px; background: var(--ink-quiet);
+    transition: background 0.18s;
+  }
+  .knob-ticks span.active { color: var(--vermillion); font-weight: 400; font-style: normal; }
+  .knob-ticks span.active::before { background: var(--vermillion); height: 12px; }
+  .knob-caption {
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+    letter-spacing: 0.34em; color: var(--ink-quiet);
+    text-transform: uppercase; margin-top: 12px;
+  }
 </style>
-<div class="knob-host" id="dial-knob-host" tabindex="0" role="slider"
-     aria-valuemin="0" aria-valuemax="4" aria-valuenow="${value}" aria-label="Tongues dial">
-  <div class="knob-arc"></div>
-  <div class="knob-indicator"></div>
-  <div class="knob-label">${value}</div>
-</div>
-<div class="knob-ticks">
-  <span data-lv="0">0</span><span data-lv="1">1</span><span data-lv="2">2</span><span data-lv="3">3</span><span data-lv="4">4</span>
+<div id="dial-knob">
+  <div class="knob-stage">
+    <div class="knob-host" id="dial-knob-host" tabindex="0" role="slider"
+         aria-valuemin="0" aria-valuemax="4" aria-valuenow="${value}" aria-label="dial">
+      <div class="knob-arc"></div>
+      <div class="knob-indicator"></div>
+      <div class="knob-label">${value}</div>
+    </div>
+  </div>
+  <div class="knob-ticks">
+    <span data-lv="0">0</span><span data-lv="1">1</span><span data-lv="2">2</span><span data-lv="3">3</span><span data-lv="4">4</span>
+  </div>
+  <div class="knob-caption">turn · drag · scroll · arrow keys</div>
 </div>
 """
 
@@ -551,54 +686,54 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     gr.HTML(
         """
         <div id="hero">
-            <h1>glossolalia</h1>
-            <p class="tagline">type a sentence, pick a voice, turn the dial.<br>
-            hear it dissolve from speech to wordless tongues, in the same voice.</p>
-            <div class="accent-line"></div>
+            <div class="eyebrow">Volume I · Thousand Token Wood</div>
+            <h1>glossolalia<span class="dot">.</span></h1>
+            <p class="tagline">a single dial that grades your lyric from speech into wordless
+            tongues, in your own voice. two phonotactic paths, one melody.</p>
+            <div class="meta">A field study<br>in dreamy dissolution</div>
         </div>
         """
     )
 
-    with gr.Row():
-        with gr.Column(scale=3):
-            sentence = gr.Textbox(label="lyric", value=DEFAULT_TEXT, lines=2,
-                                  placeholder="anything")
-        with gr.Column(scale=2):
-            voice = gr.Dropdown([(v["name"], k) for k, v in VOICE_PRESETS.items()],
-                                value=DEFAULT_VOICE, label="voice")
+    # lyric — magazine pull-quote spanning full width
+    sentence = gr.Textbox(label="the lyric", value=DEFAULT_TEXT, lines=2,
+                          placeholder="anything; the dial will dissolve it",
+                          elem_id="lyric-input")
 
+    # voice + mode in a quiet two-up
     with gr.Row():
-        mode = gr.Radio(
-            choices=list(MODES),
-            value=MODE_TONGUES,
-            label="mode",
-            info=(
-                "Ghost: real English words that sound like the source · "
-                "Tongues: invented pseudowords from the fine-tuned LoRA dial"
-            ),
-        )
+        voice = gr.Dropdown([(v["name"], k) for k, v in VOICE_PRESETS.items()],
+                            value=DEFAULT_VOICE, label="the voice", scale=1)
+        mode = gr.Radio(choices=list(MODES), value=MODE_TONGUES,
+                        label="the path", scale=1)
 
-    with gr.Row():
-        with gr.Column(scale=3):
+    # the knob — focal ritual object, centered, large
+    with gr.Row(elem_id="dial-row"):
+        with gr.Column():
             gr.HTML(KNOB_HTML)
-            level = gr.Slider(0, 4, value=0, step=1, label="", elem_id="dial-slider", visible=True)
+            level = gr.Slider(0, 4, value=0, step=1, label="", elem_id="dial-slider",
+                              visible=True)
             gr.HTML(f"<script>{KNOB_JS}</script>")
-        with gr.Column(scale=2):
-            postfx = gr.Dropdown(list(POSTFX_PRESETS.keys()), value="subtle",
-                                 label="Post-FX (reverb · chorus · octave)")
 
+    # post-fx + seed as a quiet adjuster row
     with gr.Row():
-        seed = gr.Number(value=42, precision=0, label="Seed", scale=1)
-        speak_btn = gr.Button("Speak", variant="primary", elem_classes="primary", scale=2)
-        morph_btn = gr.Button("Morph 0 → 4 (one continuous take)", variant="primary",
-                              elem_classes="primary", scale=2)
+        postfx = gr.Dropdown(list(POSTFX_PRESETS.keys()), value="subtle",
+                             label="post · reverb / chorus / octave", scale=2)
+        seed = gr.Number(value=42, precision=0, label="seed", scale=1)
 
-    audio_out = gr.Audio(label="output", type="filepath", autoplay=False)
-    ghost_lyric = gr.Textbox(label="ghost lyric (deterministic substitution at current level)",
-                              interactive=False, lines=2)
+    # two actions, side by side, the morph one in vermillion
+    with gr.Row(elem_classes="action-row"):
+        speak_btn = gr.Button("speak once", variant="primary",
+                              elem_classes="primary", scale=1)
+        morph_btn = gr.Button("morph 0 → 4 in one breath", variant="primary",
+                              elem_classes="primary", scale=1)
+
+    audio_out = gr.Audio(label="the take", type="filepath", autoplay=False)
+    ghost_lyric = gr.Textbox(label="the ghost — the deterministic substitution at this dial",
+                              interactive=False, lines=2,
+                              elem_classes="ghost-lyric")
     metrics = gr.HTML(readout())
 
-    # twisting the knob just updates the readout; Speak button drives generation
     level.change(lambda lv: readout(level=_safe_int(lv)),
                  inputs=level, outputs=metrics)
     speak_btn.click(speak, inputs=[sentence, voice, level, postfx, mode, seed],
@@ -609,10 +744,9 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     gr.HTML(
         """
         <div id="footer">
-            Open weights · runs locally on your machine · the dial is a fine-tuned control token,
-            not a DSP effect. In the lineage of Sigur Rós' Hopelandic, Lisa Gerrard, and the long
-            tradition of wordless vocal music.<br>
-            BUILD-SMALL-HACKATHON · THOUSAND TOKEN WOOD
+            <div>Open weights · all inference local · the dial is a fine-tuned
+                  control surface, not a DSP effect.</div>
+            <div>Build-Small · Thousand Token Wood</div>
         </div>
         """
     )

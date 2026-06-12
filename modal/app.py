@@ -124,13 +124,18 @@ def pull_and_generate():
         return
 
     os.chdir(REPO_DIR)
+    n_sent = os.environ.get("CORPUS_MAX_SENTENCES", "40")
+    voice_args = ["--voice", "v1:data/voices/v1.wav:data/voices/v1.txt"]
+    if os.environ.get("CORPUS_ALL_VOICES") == "1":
+        voice_args += ["--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+                       "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt"]
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
-        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
+        *voice_args,
         "--lm", "data/phoneme_lm.npz",
         "--out", "data/coherence",
-        "--max-sentences", "40",
+        "--max-sentences", n_sent,
         "--levels", "5",
         "--input-mode", "pseudo",
         "--resume",
@@ -170,9 +175,10 @@ def train_v5():
     NUM_LEVELS = 5
     DIM = 1024
     BATCH = 4
-    # v6 recipe (deep-research wf_ccca9848): Sliders-validated baseline + zero-init-escape.
-    # 200 clips / batch 4 = 50 steps/epoch. 40 epochs = 2000 steps, ~Sliders' 1000 floor x 2.
-    EPOCHS = 40
+    # Step-count targeting Sliders' ~1000-2000-step regime. For micro-spike (200 clips,
+    # 50 steps/epoch) we ran 40 epochs = 2000 steps. For full-scale (7500 clips, 1875
+    # steps/epoch) we run 1-2 epochs = 1875-3750 steps. Env var overrides for both paths.
+    EPOCHS = int(os.environ.get("V5_EPOCHS", "40"))
     LR_LORA = 2e-4     # Sliders config.yaml: AdamW 2e-4 bf16
     LEVEL_LR = 2e-3    # 10x LR_LORA: empirical, give zero-init MLP a chance to escape origin
     SEED = 42
@@ -444,8 +450,8 @@ def sweep_and_verify():
     import patches  # installs F5TTS.load_lora + set_dial
     from f5_tts.api import F5TTS
 
-    OUT = "/vol/v5_adapter"
-    SWEEP = "/vol/sweep"
+    OUT = os.environ.get("SWEEP_ADAPTER_DIR", "/vol/v5_adapter")
+    SWEEP = os.environ.get("SWEEP_OUT_DIR", "/vol/sweep")
     os.makedirs(SWEEP, exist_ok=True)
 
     tts = F5TTS(model="F5TTS_v1_Base")
@@ -541,13 +547,18 @@ def pull_and_generate_ghost():
         return
 
     os.chdir(REPO_DIR)
+    n_sent = os.environ.get("CORPUS_MAX_SENTENCES", "40")
+    voice_args = ["--voice", "v1:data/voices/v1.wav:data/voices/v1.txt"]
+    if os.environ.get("CORPUS_ALL_VOICES") == "1":
+        voice_args += ["--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+                       "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt"]
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
-        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
+        *voice_args,
         "--lm", "data/phoneme_lm.npz",
         "--out", "data/coherence_ghost",
-        "--max-sentences", "40",
+        "--max-sentences", n_sent,
         "--levels", "5",
         "--input-mode", "mondegreen",
         "--resume",
@@ -570,32 +581,50 @@ def pull_and_generate_ghost():
 def train_v9_ghost():
     """v9 LoRA: same architecture as v8, trained on the Ghost-mode (mondegreen) corpus.
 
-    Sets the V5_CORPUS_DIR and V5_OUT_DIR env vars BEFORE running the train_v5 logic
-    in-process — by directly invoking the underlying callable, bypassing Modal's
-    remote dispatch. This works because train_v5 reads those env vars at function entry.
+    Sets V5_CORPUS_DIR, V5_OUT_DIR, V5_EPOCHS env vars before invoking train_v5
+    in-process via .local(). EPOCHS defaults to 2 if not overridden — at full-scale
+    7,500 clips / batch 4 = 1875 steps/epoch, so 2 epochs lands ~3750 steps, in the
+    Sliders 1000-2000-step regime with ~2x margin.
     """
     import os
     os.environ["V5_CORPUS_DIR"] = "/vol/coherence_ghost_ds"
     os.environ["V5_OUT_DIR"] = "/vol/v9_adapter"
-    # train_v5 is a Modal function; .local() runs the wrapped function in-process.
+    os.environ.setdefault("V5_EPOCHS", "2")
     train_v5.local()
 
 
 @app.local_entrypoint()
 def main():
-    print(">> step 1: pull data + generate corpus (Tongues mode = pseudo phoneme corruption)")
+    """Full-scale Tongues run: 500 sentences x 3 voices x 5 levels = 7,500 clips, 2 epochs."""
+    import os
+    os.environ.setdefault("V5_EPOCHS", "2")
+    print(">> step 1: pull data + generate corpus (Tongues = pseudo, 7500 clips)")
     pull_and_generate.remote()
-    print("\n>> step 2: train v8 (Tongues mode)")
+    print("\n>> step 2: train v8 (Tongues mode, ~3750 steps)")
     train_v5.remote()
     print("\n>> step 3: sweep + spectral verify")
     sweep_and_verify.remote()
     print("\n>> done. Tongues adapter on volume at /vol/v5_adapter")
 
 
+@app.function(gpu="A100-40GB", volumes={"/vol": vol}, timeout=60 * 30)
+def sweep_v9_ghost():
+    import os
+    os.environ["SWEEP_ADAPTER_DIR"] = "/vol/v9_adapter"
+    os.environ["SWEEP_OUT_DIR"] = "/vol/sweep_ghost"
+    sweep_and_verify.local()
+
+
+@app.local_entrypoint()
+def sweep_ghost():
+    sweep_v9_ghost.remote()
+
+
 @app.local_entrypoint()
 def main_ghost():
-    print(">> step 1: pull data + generate corpus (Ghost mode = mondegreen substitution)")
+    """Full-scale Ghost run: 500 sentences x 3 voices x 5 levels = 7,500 clips, 2 epochs."""
+    print(">> step 1: pull data + generate corpus (Ghost = mondegreen, 7500 clips)")
     pull_and_generate_ghost.remote()
-    print("\n>> step 2: train v9 (Ghost mode LoRA)")
+    print("\n>> step 2: train v9 (Ghost mode LoRA, ~3750 steps)")
     train_v9_ghost.remote()
     print("\n>> done. Ghost adapter on volume at /vol/v9_adapter")
