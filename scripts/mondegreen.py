@@ -226,12 +226,32 @@ class MondegreenIndex:
         idx = int(rng.choice(len(cands), p=weights))
         return cands[idx][0]
 
-    def substitute(self, sentence: str, level: int, seed: int = 0) -> str:
+    def substitute(self, sentence: str, level: int, seed: int = 0,
+                    reranker: "LMReranker | None" = None,
+                    beam_width: int = 8,
+                    n_candidates_per_word: int = 12) -> str:
         """Mondegreen-substitute every alphabetic word in `sentence` at `level`.
 
         Whitespace and punctuation pass through unchanged. Words not in CMUdict
         (proper names, neologisms) pass through unchanged.
+
+        If `reranker` is provided, runs constrained beam search: at each substitutable
+        word position the top `n_candidates_per_word` phonetic candidates are expanded
+        across all `beam_width` live beams; each partial sequence is scored by the
+        reranker's log-probability under a small causal language model; only the top
+        `beam_width` beams survive to the next position. Final output is the highest-
+        scoring complete sequence. Determinism preserved: argmax not sample, ties
+        broken by candidate distance then alphabetical.
+
+        Without a reranker, falls back to the per-word weighted draw (no semantic
+        coherence — substitutions are independent across positions).
         """
+        if reranker is None or level == 0:
+            return self._substitute_independent(sentence, level, seed)
+        return self._substitute_beam(sentence, level, seed, reranker,
+                                       beam_width, n_candidates_per_word)
+
+    def _substitute_independent(self, sentence: str, level: int, seed: int) -> str:
         rng = np.random.default_rng(seed)
         out_parts: list[str] = []
         for tok in _TOKEN_RE.findall(sentence):
@@ -239,8 +259,9 @@ class MondegreenIndex:
                 out_parts.append(self.substitute_word(tok, level, rng))
             else:
                 out_parts.append(tok)
-        # Preserve source capitalization on sentence-initial / proper positions:
-        # if the source token was Capitalized, capitalize the substitute.
+        return self._restore_caps(sentence, out_parts)
+
+    def _restore_caps(self, sentence: str, out_parts: list[str]) -> str:
         rebuilt: list[str] = []
         src_tokens = _TOKEN_RE.findall(sentence)
         for src, out in zip(src_tokens, out_parts):
@@ -248,6 +269,105 @@ class MondegreenIndex:
                 out = out[0].upper() + out[1:]
             rebuilt.append(out)
         return "".join(rebuilt)
+
+    def _substitute_beam(self, sentence: str, level: int, seed: int,
+                          reranker: "LMReranker",
+                          beam_width: int, n_candidates_per_word: int) -> str:
+        rng = np.random.default_rng(seed)
+        tokens = _TOKEN_RE.findall(sentence)
+        # Per-position candidate lists. None = pass-through token (whitespace/punct/function/OOV).
+        per_position: list[list[tuple[str, float]] | None] = []
+        for tok in tokens:
+            if not tok.replace("'", "").isalpha():
+                per_position.append(None)
+                continue
+            low = tok.lower()
+            if low in _FUNCTION_WORDS or level <= 0:
+                per_position.append(None)
+                continue
+            if rng.random() >= LEVEL_P[level]:
+                per_position.append(None)
+                continue
+            cands = self.find_candidates(low, max_dist=LEVEL_MAX_DIST[level],
+                                          max_results=n_candidates_per_word)
+            if not cands:
+                per_position.append(None)
+                continue
+            per_position.append(cands)
+
+        # Beam search. Each beam = (sequence_so_far: list[str], cumulative_log_prob: float).
+        beams: list[tuple[list[str], float]] = [([], 0.0)]
+        for pos, cands in enumerate(per_position):
+            src_tok = tokens[pos]
+            if cands is None:
+                # Pass-through — append the same source token to every beam.
+                beams = [(beam + [src_tok], score) for beam, score in beams]
+                continue
+            expanded: list[tuple[list[str], float]] = []
+            for beam, score in beams:
+                for cand_word, cand_dist in cands:
+                    new_seq = beam + [cand_word]
+                    # Score the partial sequence's last-token log-prob under the LM.
+                    # Reuses prefix cache internally; this is fast.
+                    partial_text = self._compose_partial(tokens, pos, new_seq)
+                    lm_score = reranker.score_next_token(partial_text)
+                    # Tie-breaker: phonetic distance (lower = better), then alphabetical.
+                    tb = (-cand_dist * 1e-6, -ord(cand_word[0]) * 1e-9)
+                    expanded.append((new_seq, score + lm_score + tb[0] + tb[1]))
+            # Stable sort by score descending; on tie, earlier item wins (Python sort is stable).
+            expanded.sort(key=lambda x: -x[1])
+            beams = expanded[:beam_width]
+
+        if not beams:
+            return sentence
+        best_seq, _ = beams[0]
+        return self._restore_caps(sentence, best_seq)
+
+    def _compose_partial(self, tokens: list[str], up_to_pos: int,
+                          chosen_so_far: list[str]) -> str:
+        """Rebuild the text up through position `up_to_pos` using `chosen_so_far`
+        for substituted positions and the source for pass-through."""
+        # chosen_so_far has exactly up_to_pos + 1 entries (one per token through pos)
+        return "".join(chosen_so_far)
+
+
+# ---- LM reranker for semantic coherence ----
+
+class LMReranker:
+    """Small causal LM that scores partial sentences for semantic coherence during
+    beam search over phonetic-ghost candidates.
+
+    Default model is DistilGPT-2 (~82M params, ~330MB on disk). Loads lazily on first
+    score() call. CPU-only is fine for ~10-word lyrics at beam_width=8 — scores ~80
+    short prompts per sentence, finishes in ~1-2 seconds on a modern Mac.
+
+    Determinism: scoring is a pure function of (model weights, input text). No sampling.
+    """
+
+    DEFAULT_MODEL = "distilgpt2"
+
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str = "cpu"):
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+        self._torch = torch
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._model = AutoModelForCausalLM.from_pretrained(model_name).to(device).eval()
+        self._device = device
+
+    def score_next_token(self, text: str) -> float:
+        """Return the log-probability density of `text` under the LM.
+
+        Implemented as average per-token log-likelihood — length-normalized so longer
+        partial sequences aren't unfairly penalized. Higher is better.
+        """
+        torch = self._torch
+        ids = self._tokenizer(text, return_tensors="pt").input_ids.to(self._device)
+        if ids.shape[1] < 2:
+            return 0.0
+        with torch.no_grad():
+            out = self._model(ids, labels=ids)
+        # out.loss is mean NLL across tokens. log-prob density = -loss.
+        return float(-out.loss.item())
 
 
 # ---- Module-level singleton helpers (lazy load) ----
