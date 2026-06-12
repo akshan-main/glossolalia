@@ -176,7 +176,9 @@ def train_v5():
     LR_LORA = 2e-4     # Sliders config.yaml: AdamW 2e-4 bf16
     LEVEL_LR = 2e-3    # 10x LR_LORA: empirical, give zero-init MLP a chance to escape origin
     SEED = 42
-    OUT_DIR = "/vol/v5_adapter"
+    # Allow override via env vars so train_v9_ghost can reuse this function for the Ghost corpus.
+    OUT_DIR = os.environ.get("V5_OUT_DIR", "/vol/v5_adapter")
+    CORPUS_DIR = os.environ.get("V5_CORPUS_DIR", "/vol/coherence_ds")
     os.makedirs(OUT_DIR, exist_ok=True)
     torch.manual_seed(SEED)
     device = "cuda"
@@ -331,7 +333,7 @@ def train_v5():
             "scalars": torch.tensor([b["scalar"] for b in batch], dtype=torch.float32),
         }
 
-    ds = CoherenceDS("/vol/coherence_ds/metadata.csv")
+    ds = CoherenceDS(f"{CORPUS_DIR}/metadata.csv")
     dl = DataLoader(ds, batch_size=BATCH, shuffle=True, collate_fn=collate,
                     num_workers=2, drop_last=True)
     print(f"  dataset rows: {len(ds)}, batches/epoch: {len(dl)}")
@@ -500,12 +502,100 @@ def sweep_and_verify():
     print(f"  gate (>=4 audible to pass): {'PASS' if n_audible >= 4 else 'FAIL'}")
 
 
+@app.function(
+    gpu="A100-40GB",
+    volumes={"/vol": vol},
+    timeout=60 * 60,
+)
+def pull_and_generate_ghost():
+    """v9: regenerate corpus with --input-mode=mondegreen for Ghost mode LoRA training.
+    Saves to /vol/coherence_ghost and /vol/coherence_ghost_ds — does not overwrite v8 corpus."""
+    import os, shutil, subprocess
+    _setup_repo()
+
+    from huggingface_hub import snapshot_download
+    p = snapshot_download(
+        repo_id="akshan-main/glossolalia-inputs",
+        repo_type="dataset",
+        local_dir=f"{REPO_DIR}/data_pull",
+    )
+    os.makedirs(f"{REPO_DIR}/data/voices", exist_ok=True)
+    for f in ("sentences.txt", "phoneme_lm.npz", "cmudict.dict"):
+        s = os.path.join(p, f)
+        if os.path.exists(s):
+            shutil.copy(s, f"{REPO_DIR}/data/{f}")
+    vd = os.path.join(p, "voices")
+    if os.path.isdir(vd):
+        for f in os.listdir(vd):
+            shutil.copy(os.path.join(vd, f), f"{REPO_DIR}/data/voices/{f}")
+    print("  sentences:", sum(1 for _ in open(f"{REPO_DIR}/data/sentences.txt")))
+
+    os.makedirs("/vol/voices", exist_ok=True)
+    for f in os.listdir(f"{REPO_DIR}/data/voices"):
+        shutil.copy(f"{REPO_DIR}/data/voices/{f}", f"/vol/voices/{f}")
+
+    if os.path.isdir("/vol/coherence_ghost_ds") and \
+       os.path.exists("/vol/coherence_ghost_ds/metadata.csv"):
+        print("  ghost corpus already on volume, skipping")
+        vol.commit()
+        return
+
+    os.chdir(REPO_DIR)
+    subprocess.check_call([
+        "python", "scripts/generate_coherence_data.py",
+        "--sentences", "data/sentences.txt",
+        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
+        "--lm", "data/phoneme_lm.npz",
+        "--out", "data/coherence_ghost",
+        "--max-sentences", "40",
+        "--levels", "5",
+        "--input-mode", "mondegreen",
+        "--resume",
+    ])
+    subprocess.check_call([
+        "python", "scripts/build_coherence_dataset.py",
+        "--data", "data/coherence_ghost",
+        "--out", "data/coherence_ghost_ds",
+    ])
+    shutil.copytree(f"{REPO_DIR}/data/coherence_ghost", "/vol/coherence_ghost", dirs_exist_ok=True)
+    shutil.copytree(f"{REPO_DIR}/data/coherence_ghost_ds", "/vol/coherence_ghost_ds", dirs_exist_ok=True)
+    vol.commit()
+
+
+@app.function(
+    gpu="A100-40GB",
+    volumes={"/vol": vol},
+    timeout=60 * 60 * 2,
+)
+def train_v9_ghost():
+    """v9 LoRA: same architecture as v8, trained on the Ghost-mode (mondegreen) corpus.
+
+    Sets the V5_CORPUS_DIR and V5_OUT_DIR env vars BEFORE running the train_v5 logic
+    in-process — by directly invoking the underlying callable, bypassing Modal's
+    remote dispatch. This works because train_v5 reads those env vars at function entry.
+    """
+    import os
+    os.environ["V5_CORPUS_DIR"] = "/vol/coherence_ghost_ds"
+    os.environ["V5_OUT_DIR"] = "/vol/v9_adapter"
+    # train_v5 is a Modal function; .local() runs the wrapped function in-process.
+    train_v5.local()
+
+
 @app.local_entrypoint()
 def main():
-    print(">> step 1: pull data + generate corpus")
+    print(">> step 1: pull data + generate corpus (Tongues mode = pseudo phoneme corruption)")
     pull_and_generate.remote()
-    print("\n>> step 2: train v5")
+    print("\n>> step 2: train v8 (Tongues mode)")
     train_v5.remote()
     print("\n>> step 3: sweep + spectral verify")
     sweep_and_verify.remote()
-    print("\n>> done. Adapter on volume at /vol/v5_adapter")
+    print("\n>> done. Tongues adapter on volume at /vol/v5_adapter")
+
+
+@app.local_entrypoint()
+def main_ghost():
+    print(">> step 1: pull data + generate corpus (Ghost mode = mondegreen substitution)")
+    pull_and_generate_ghost.remote()
+    print("\n>> step 2: train v9 (Ghost mode LoRA)")
+    train_v9_ghost.remote()
+    print("\n>> done. Ghost adapter on volume at /vol/v9_adapter")
