@@ -38,6 +38,7 @@ image = (
         "huggingface_hub",
         "safetensors",
         "g2p_en",
+        "panphon",
         "jiwer",
         "openai-whisper",
         "resemblyzer",

@@ -96,9 +96,9 @@ def main():
         corrupted_by_level = {}
         for lv in range(args.levels):
             seed = args.seed_base + si * 31 + lv
-            arpa, ipa, pseudo = corrupt_sentence(sentence, lv, lm, seed=seed)
+            arpa, ipa, pseudo, display = corrupt_sentence(sentence, lv, lm, seed=seed)
             corrupted_by_level[lv] = {"arpabet": " ".join(t for t in arpa if t.strip()),
-                                      "ipa": ipa, "pseudo": pseudo}
+                                      "ipa": ipa, "pseudo": pseudo, "display": display}
 
         for voice in voices:
             for lv in range(args.levels):
@@ -129,7 +129,8 @@ def main():
                     "voice": voice["id"], "voice_wav": voice["wav"],
                     "level": lv, "level_p": LEVEL_P[lv],
                     "input_mode": args.input_mode, "gen_text": gen_text,
-                    "arpabet": gen["arpabet"], "ipa": gen["ipa"], "pseudo": gen["pseudo"],
+                    "arpabet": gen["arpabet"], "ipa": gen["ipa"],
+                    "pseudo": gen["pseudo"], "display": gen["display"],
                 }
                 meta_path.write_text(json.dumps(meta, indent=2))
                 manifest_f.write(json.dumps({
