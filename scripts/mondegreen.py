@@ -38,7 +38,12 @@ Design choices (no published precedent claimed):
   - Distance schedule and probability schedule are hand-chosen for a smooth dial.
   - Syllable-count enforcement is a design choice for singability, grounded in the standard
     lyric-substitution constraint in parody/pastiche traditions (no specific citation).
-  - Function-word handling: substituted by default at any dial level (no special carve-out).
+  - Stress-position match is enforced (same primary-stress syllable index in source and
+    candidate). Music-cognition literature (Kolinsky et al., Empirical Musicology Review)
+    surfaced by workflow synthesis — not personally re-verified for this docstring.
+  - Function-word handling: HELD CONSTANT at all dial levels (small closed-class set in
+    _FUNCTION_WORDS). Substituting them adds noise where listeners process with delayed
+    commitment; we skip them so the ghost lands on the content-word stress points.
 """
 
 from __future__ import annotations
