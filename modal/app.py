@@ -124,18 +124,15 @@ def pull_and_generate():
         return
 
     os.chdir(REPO_DIR)
-    n_sent = os.environ.get("CORPUS_MAX_SENTENCES", "40")
-    voice_args = ["--voice", "v1:data/voices/v1.wav:data/voices/v1.txt"]
-    if os.environ.get("CORPUS_ALL_VOICES") == "1":
-        voice_args += ["--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
-                       "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt"]
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
-        *voice_args,
+        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
+        "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+        "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
         "--lm", "data/phoneme_lm.npz",
         "--out", "data/coherence",
-        "--max-sentences", n_sent,
+        "--max-sentences", "500",
         "--levels", "5",
         "--input-mode", "pseudo",
         "--resume",
@@ -175,10 +172,9 @@ def train_v5():
     NUM_LEVELS = 5
     DIM = 1024
     BATCH = 4
-    # Step-count targeting Sliders' ~1000-2000-step regime. For micro-spike (200 clips,
-    # 50 steps/epoch) we ran 40 epochs = 2000 steps. For full-scale (7500 clips, 1875
-    # steps/epoch) we run 1-2 epochs = 1875-3750 steps. Env var overrides for both paths.
-    EPOCHS = int(os.environ.get("V5_EPOCHS", "40"))
+    # Sliders' ~1000-2000-step regime. Full-scale 7500 clips / batch 4 = 1875 steps per epoch.
+    # 2 epochs lands at 3750 steps, ~2x Sliders' 1000 floor.
+    EPOCHS = 2
     LR_LORA = 2e-4     # Sliders config.yaml: AdamW 2e-4 bf16
     LEVEL_LR = 2e-3    # 10x LR_LORA: empirical, give zero-init MLP a chance to escape origin
     SEED = 42
@@ -547,18 +543,15 @@ def pull_and_generate_ghost():
         return
 
     os.chdir(REPO_DIR)
-    n_sent = os.environ.get("CORPUS_MAX_SENTENCES", "40")
-    voice_args = ["--voice", "v1:data/voices/v1.wav:data/voices/v1.txt"]
-    if os.environ.get("CORPUS_ALL_VOICES") == "1":
-        voice_args += ["--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
-                       "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt"]
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
-        *voice_args,
+        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
+        "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+        "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
         "--lm", "data/phoneme_lm.npz",
         "--out", "data/coherence_ghost",
-        "--max-sentences", n_sent,
+        "--max-sentences", "500",
         "--levels", "5",
         "--input-mode", "mondegreen",
         "--resume",
