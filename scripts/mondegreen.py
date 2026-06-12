@@ -96,6 +96,26 @@ def _phones_to_ipa_seq(phones: tuple[str, ...]) -> str:
     return " ".join(_ARPABET_TO_IPA[p] for p in phones if p in _ARPABET_TO_IPA)
 
 
+def _primary_stress_syllable(phones_with_stress: tuple[str, ...]) -> int:
+    """Index (0-based) of the syllable carrying primary stress (digit '1').
+
+    Returns -1 if no primary stress is marked (e.g. single-syllable function words).
+    Used to match source-vs-candidate stress position: substituting a trochaic word
+    (stress on syllable 0) with an iambic candidate (stress on syllable 1) makes the
+    ghost rhythmically wrong and breaks perception under the original melody.
+    Citation provenance: Kolinsky et al. (emusicology.org/article/view/3729) + EEG
+    study PMC3225926 — stress mismatch degrades word recognition in song contexts.
+    """
+    syl_idx = -1
+    for p in phones_with_stress:
+        base = p.rstrip("012")
+        if base in _ARPABET_VOWELS:
+            syl_idx += 1
+            if p.endswith("1"):
+                return syl_idx
+    return -1
+
+
 class MondegreenIndex:
     """Per-process CMUdict index plus PanPhon distance computation.
 
@@ -114,6 +134,7 @@ class MondegreenIndex:
                            .read().decode("utf-8", errors="ignore"))
 
         word_to_arpa: dict[str, tuple[str, ...]] = {}
+        word_to_arpa_stressed: dict[str, tuple[str, ...]] = {}
         for line in cmu.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line or line.startswith(";;;"):
@@ -122,22 +143,31 @@ class MondegreenIndex:
             if len(parts) < 2:
                 continue
             word = parts[0].lower().split("(")[0]
-            phones = tuple(tok.rstrip("012") for tok in parts[1:] if tok)
+            phones_with_stress = tuple(parts[1:])
+            phones = tuple(tok.rstrip("012") for tok in phones_with_stress if tok)
             # Reject lines that contain non-ARPAbet tokens
             if any(p not in _ARPABET_TO_IPA for p in phones):
                 continue
             # Keep canonical pronunciation only (first entry per word)
             if word.replace("'", "").isalpha() and phones and word not in word_to_arpa:
                 word_to_arpa[word] = phones
+                word_to_arpa_stressed[word] = phones_with_stress
 
         self._word_to_arpa = word_to_arpa
+        self._word_to_arpa_stressed = word_to_arpa_stressed
         self._word_to_syl = {w: _syllable_count(p) for w, p in word_to_arpa.items()}
         self._word_to_ipa = {w: _phones_to_ipa_seq(p) for w, p in word_to_arpa.items()}
+        self._word_to_stress_pos = {
+            w: _primary_stress_syllable(word_to_arpa_stressed[w])
+            for w in word_to_arpa
+        }
 
-        # Syllable bucket for fast candidate enumeration.
-        self._syl_bucket: dict[int, list[str]] = {}
-        for w, s in self._word_to_syl.items():
-            self._syl_bucket.setdefault(s, []).append(w)
+        # Syllable bucket for fast candidate enumeration, sub-keyed by primary stress position
+        # so candidate scans are O(bucket size for matching stress) rather than O(all words).
+        self._syl_stress_bucket: dict[tuple[int, int], list[str]] = {}
+        for w in self._word_to_arpa:
+            key = (self._word_to_syl[w], self._word_to_stress_pos[w])
+            self._syl_stress_bucket.setdefault(key, []).append(w)
 
     @property
     def size(self) -> int:
@@ -156,8 +186,13 @@ class MondegreenIndex:
             return []
         src_ipa = self._word_to_ipa[word]
         src_syl = self._word_to_syl[word]
+        src_stress = self._word_to_stress_pos[word]
+        # Candidates are bucketed by (syllable count, primary stress position) — both
+        # must match. Stress-mismatched substitutes break the perceptual ghost under
+        # the original melody (Kolinsky et al.; EEG study PMC3225926).
+        bucket = self._syl_stress_bucket.get((src_syl, src_stress), [])
         cands: list[tuple[str, float]] = []
-        for cand in self._syl_bucket.get(src_syl, []):
+        for cand in bucket:
             if cand == word or len(cand.replace("'", "")) <= 1:
                 continue
             d = float(self._dist.hamming_feature_edit_distance(
