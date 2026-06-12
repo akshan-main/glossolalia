@@ -63,6 +63,41 @@ Every load-bearing choice in this project, with the reasoning + citations. Each 
 - **NOT cited:** Concept Sliders (Gandikota et al., ECCV 2024) — verified at [`sliders/trainscripts/textsliders/lora.py`](https://github.com/rohitgandikota/sliders) L249, it is a SCALAR-MODULATED LORA (`org_forward(x) + lora_up(lora_down(x)) * multiplier * scale`), not a per-level embedding table. The signed-direction LECO training assumes opposing prompt pairs we do not have. Using it as precedent for our setup would be inaccurate.
 - **Workflow:** *F5-TTS per-level embedding architecture*, 2026-06-02. 14 of 18 claims survived adversarial verification.
 
+## 2026-06-11 — Phoneme substitution kernel: PanPhon Boltzmann × dreamy_weight (replaces bigram-conditional draw)
+
+- **Choice:** Replace the bigram-conditional class-masked draw in `scripts/corrupt_phonemes.py:corrupt()` with a Boltzmann distribution over the 39 ARPAbet phonemes:
+  ```
+  q(y | x, level) ∝ exp( -D[x,y] / T(level) ) * bias_weight(y)
+  T(level) = 0.5 * exp(2.5 * p_level)   # T(0)=0.50, T(2)=1.75, T(4)=6.09
+  ```
+  `D` is the 39×39 PanPhon feature-edit-distance matrix, computed at LM-build time and stored in `data/phoneme_lm.npz`. `bias_weight` is the per-phoneme multiplier from the active preset (`dreamy` by default). At lv3-4 we also apply CV cluster simplification (collapse CC onset runs).
+- **Rejected:** (a) Keep the bigram-conditional draw — produces phonetically arbitrary substitutions; v7 ear-test confirmed lv4 audio sounded like a different sentence, not a phonetic ghost. (b) Use Hirjee & Brown 2010 mondegreen confusion matrix — refuted by workflow `wtrmaydq7` (mondegreens are lexically motivated; would produce misheard English words at lv2, opposite of glossolalia). (c) Miller & Nicely 1955 consonant confusion matrix — only 16 consonants, noise-condition-specific, no vowel data.
+- **What this gives us vs. v7:** at lv0 the lyric stays nearly identity (T=0.5 puts ~98% weight on self for most phonemes); at lv2 substitutions stay within Hamming distance 2-3 (P↔B, S↔SH, F↔V — near-minimal phonetic pairs); at lv4 the distribution opens and bias_weight steers the attractor toward sonorants/voiced fricatives/open back vowels. Local diverse-input test verified syllable count is preserved across cluster-heavy ("Strange tides crash"), vowel-heavy ("Oh how I love"), proper-name ("Eleanor walked through Aberdeen"), and long-form ("The endless rain falls softly...") inputs at all 5 levels.
+- **What survives verification, what doesn't:**
+  - **PanPhon distance values verified** by direct measurement against the installed library: P/B=1, S/SH=2, P/M=3, P/ZH=7, K/N=8, AA/P=11 — all match. Matrix range [0, 48].
+  - **F5-TTS character-mode confirmed** by issue #362 (SWivid, owner): "current base models are using characters rather than phonemes" — pseudo-ASCII input is in-distribution.
+  - **CV preference grounded** in [Link & Tomaschek 2024](https://pmc.ncbi.nlm.nih.gov/articles/PMC10916350/) (95.7% CV in 7,486 German-L1 glossolalia syllables; top-6 syllables `[na, ra, la, ja, ba, da]`) AND in [Samarin 1973 *Language and Speech* 16:1](https://archive.org/details/tonguesofmenange0000sama/) ("preference for open syllables" as one of four formal features of glossolalia). This justifies CV cluster simplification at lv3-4.
+  - **T(level) exponential schedule** is a design choice. No published precedent for this exact formula on TTS phoneme corruption; chosen by feel + smoke-tested on diverse inputs.
+  - **`bias_weight` (dreamy preset) values are a design heuristic.** Earlier comments overclaimed Link & Tomaschek 2024 + Crystal 1995 as sources for the multipliers — neither paper publishes per-phoneme frequency tables, and Samarin's own onset data shows obstruent dominance (~79%) over sonorants (~19%), directly contradicting any "sonorant-heavy" provenance claim. The multipliers are hand-tuned by the author for a soft/sustained aesthetic. See correction below to the 2026-06-01 entry.
+  - **PanPhon paper provenance is honest now:** the library exposes 24 features (3 added post the original COLING 2016 paper which had 21) and uses an external ARPAbet→IPA conversion (handled by us). Cited as a library, not as theoretical validation.
+  - **Concept Sliders r=4 α=1 1000 iter recipe** (used to inform v6) targets SD-UNet, not DiT — informed prior, not validated transfer. v6 empirical refutation (0/9 audible) confirmed the architecture difference matters.
+- **Sources (only what was verified against the primary):** PanPhon library (Mortensen et al., COLING 2016, [aclanthology.org/C16-1328](https://aclanthology.org/C16-1328/)) — used as software; Link & Tomaschek 2024 ([PMC10916350](https://pmc.ncbi.nlm.nih.gov/articles/PMC10916350/)) — CV figure and top-6 syllables, NOT per-phoneme multipliers; Samarin 1973 *Language and Speech* 16:1 — CV preference; F5-TTS issue [#362](https://github.com/SWivid/F5-TTS/issues/362) (SWivid) — character input mode. Anything previously cited that did not survive the audit has been removed from this entry.
+- **Workflows:** Feature-distance recipe synthesis [`wtrmaydq7`](#) (5 probes, 2 refuted in adversarial verify); citation audit [`wtq6yi1zc`](#) (10 citations, 6 refuted/partial — drove the rewrite of the dreamy provenance, this entry, and the build_phoneme_lm.py docstring).
+
+## 2026-06-11 — CORRECTION to 2026-06-01 "Phoneme LM rebias toward dreamy / wordless-vocal palette"
+
+The 2026-06-01 entry implied that the dreamy preset's per-phoneme multipliers (M=1.6, L=1.5, AA=1.8, etc.) were derived from Link & Tomaschek 2024 + Pattison 1968 + Bryant & O'Connell 1971 + Crystal 1995. Citation audit `wtq6yi1zc` 2026-06-11 refuted that:
+
+- Link & Tomaschek 2024 documents syllable *structure* (95.7% CV) and top-6 *syllable types* `[na, ra, la, ja, ba, da]` — but does NOT publish per-phoneme frequency tables. The multipliers are not derivable from this source.
+- Samarin's onset-consonant frequency data (the paper *is* Samarin 1973, *Language and Speech* 16:1, not 1972 *Tongues of Men and Angels*) shows obstruents ~79% vs sonorants ~19% in onset position — *contradicting* the "sonorant-heavy" framing.
+- Crystal 1995 "Phonaesthetically Speaking" favors *closed* mid-to-high vowels for aesthetic pleasantness, not open vowels — *contradicts* the "open vowel = dreamy" framing.
+
+Honest provenance for the dreamy preset multipliers (and the `sigur-ros` and `fraser` presets):
+
+> Hand-tuned design heuristic. The author chose to boost sonorants and open back vowels and suppress voiceless stops/affricates because that palette sounds soft and sustained to the author's ear. The values are not derived from a published frequency table. Samarin's CV preference grounds the syllable-shape preservation; the per-phoneme weighting beyond CV is aesthetic choice.
+
+This honest provenance now lives in [scripts/build_phoneme_lm.py](scripts/build_phoneme_lm.py) lines 50-70 (the docstring for BIAS_PRESETS).
+
 ## 2026-06-11 — v7 LoRA recipe: keep v5's capacity, take v6's training intensity *(v6 rejected)*
 
 - **v6 result (FAIL, 0/9 audible):** the Sliders-style capacity strip (r=16→4, α=16→1, drop `attn_norm.linear`) collapsed the dial WORSE than v5's 4/9. v5 lv0-vs-lv4 corr was 0.79 / 0.90 / 0.79 across three sentences; v6 was 0.94 / 0.91 / 0.86. The capacity reduction broke the LoRA's ability to learn the corruption mapping at all.
