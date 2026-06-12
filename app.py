@@ -1,8 +1,16 @@
-"""The Un-Language Slider — a single dial that grades a typed sentence from intelligible speech
-to phonotactically-valid English-native glossolalia in the same voice. Powered by F5-TTS + a
-fine-tuned LoRA where one control token (`tongues zero..four`) maps to the dissolution level.
+"""Glossolalia Dial — a single dial that grades a typed lyric into dreamy territory in two
+distinct phonotactic paths:
 
-This is the v1 Gradio app (gr.Blocks). v2 is in app_server.py (gradio.Server custom HTML knob).
+  Ghost mode: lyric is rewritten as a sequence of real English words (mondegreen substitution).
+              Constrained by syllable count, primary-stress position, PanPhon feature-edit
+              distance; reranked by DistilGPT-2 for semantic coherence. F5-TTS base reads it.
+  Tongues mode: clean lyric goes into F5-TTS + a fine-tuned LoRA + a learned scalar conditioner
+                (LevelEmbed at AdaLN side). The LoRA produces graded glossolalic audio in the
+                user's chosen voice — invented pseudowords, sonorant-leaning palette.
+
+Both modes ride F5-TTS for voice cloning + audio synthesis. Off-the-Grid: no cloud APIs.
+
+v1 Gradio app (gr.Blocks). v2 (Off-Brand badge) is in app_server.py.
 """
 
 from __future__ import annotations
@@ -22,21 +30,57 @@ from scripts.post_fx import PRESETS as POSTFX_PRESETS, apply_post_fx
 
 VOICE_IDS = list(VOICE_PRESETS.keys())
 DEFAULT_VOICE = VOICE_IDS[0] if VOICE_IDS else "v1"
-DEFAULT_TEXT = "I had a dream last night about the ocean."
+DEFAULT_TEXT = "the river was wide and calm in the morning light"
 # default to the published LoRA repo so the Space loads it without needing env vars;
 # COHERENCE_DIAL_LORA env var overrides for local dev against a checkpoint dir.
 LORA_PATH = os.environ.get("COHERENCE_DIAL_LORA", HF_LORA_REPO)
+
+MODE_GHOST = "Ghost"
+MODE_TONGUES = "Tongues"
+MODES = (MODE_GHOST, MODE_TONGUES)
 
 
 # ----- inference engine (lazy-loaded; falls back to a silent stub if F5-TTS isn't installed) -----
 
 class TTSEngine:
+    """Dual-mode engine. One F5-TTS instance with the v8 LoRA loaded; mode is selected per
+    inference call. For Ghost mode we set_dial(0) (LevelEmbed contributes ~zero) and feed
+    mondegreen-substituted text. For Tongues mode we set_dial(level) and feed the clean
+    lyric. The base LoRA attention adaptation is always on, but at dial=0 it produces audio
+    indistinguishable from F5-TTS base (verified empirically by v5 sweep — lv0 sounded
+    identical to base output)."""
+
     def __init__(self):
         self._tts = None
         self._asr = None
         self._enc = None
+        self._mondegreen = None
+        self._lm = None
         self._lora_loaded = False
         self.live = False
+
+    def _ensure_mondegreen(self):
+        """Lazy load the deterministic phonetic-ghost generator + DistilGPT-2 reranker."""
+        if self._mondegreen is not None:
+            return
+        try:
+            from scripts.mondegreen import MondegreenIndex, LMReranker
+            self._mondegreen = MondegreenIndex("data/cmudict.dict")
+            print(f"[engine] Mondegreen index loaded ({self._mondegreen.size} words)")
+            self._lm = LMReranker()
+            print("[engine] DistilGPT-2 reranker loaded")
+        except Exception as e:
+            print(f"[engine] mondegreen load FAILED ({e}); Ghost mode falls back to clean text")
+            self._mondegreen = False
+            self._lm = False
+
+    def ghost_text(self, sentence: str, level: int, seed: int = 42) -> str:
+        """Deterministic Ghost mode substitution. Returns the source if mondegreen unavailable."""
+        self._ensure_mondegreen()
+        if not self._mondegreen:
+            return sentence
+        return self._mondegreen.substitute(sentence, level, seed=seed,
+                                            reranker=(self._lm or None))
 
     def _ensure(self):
         if self._tts is not None:
@@ -78,26 +122,40 @@ class TTSEngine:
                 self._enc = False
         return self._enc
 
-    def generate(self, sentence: str, voice_id: str, level: int, seed: int = 42):
-        """Returns (mono numpy float32, sample_rate)."""
+    def generate(self, sentence: str, voice_id: str, level: int, seed: int = 42,
+                  mode: str = MODE_TONGUES):
+        """Returns (audio float32 mono, sample_rate, gen_text_used).
+
+        mode=MODE_GHOST: substitute lyric via mondegreen at given level, set_dial(0), TTS reads it.
+        mode=MODE_TONGUES: leave lyric clean, set_dial(level), LoRA conditions glossolalic audio.
+        """
         self._ensure()
         voice = VOICE_PRESETS[voice_id]
-        prompt = f"{sentence} | {CONTROL_STEM} {LEVEL_WORDS[level]}"
+        if mode == MODE_GHOST:
+            gen_text = self.ghost_text(sentence, level, seed=seed)
+            tts_dial = 0
+        else:
+            gen_text = sentence
+            tts_dial = level
         if not self.live:
-            # silent stub at SAMPLE_RATE, ~3s, for UI testing
-            return np.zeros(SAMPLE_RATE * 3, dtype=np.float32), SAMPLE_RATE
+            return np.zeros(SAMPLE_RATE * 3, dtype=np.float32), SAMPLE_RATE, gen_text
+        if hasattr(self._tts, "set_dial"):
+            try:
+                self._tts.set_dial(tts_dial)
+            except Exception as e:
+                print(f"[engine] set_dial({tts_dial}) FAILED ({e}); proceeding without conditioning")
         out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
         ref_text = ""
         ref_txt = Path(voice["ref_text"])
         if ref_txt.exists():
             ref_text = ref_txt.read_text(encoding="utf-8").strip()
         self._tts.infer(ref_file=voice["wav"], ref_text=ref_text,
-                        gen_text=prompt, file_wave=out, seed=seed)
+                        gen_text=gen_text, file_wave=out, seed=seed)
         import soundfile as sf
         y, sr = sf.read(out, always_2d=False)
         if y.ndim == 2:
             y = y.mean(axis=1)
-        return y.astype(np.float32), sr
+        return y.astype(np.float32), sr, gen_text
 
     def transcribe_wer(self, y: np.ndarray, sr: int, ref_text: str) -> float | None:
         asr = self._ensure_asr()
@@ -184,122 +242,154 @@ def _safe_int(v, lo: int = 0, hi: int = 4) -> int:
         return lo
 
 
-def speak(sentence: str, voice_id: str, level, postfx_preset: str, seed: int = 42):
+def speak(sentence: str, voice_id: str, level, postfx_preset: str, mode: str, seed: int = 42):
     sentence = (sentence or "").strip()
     level = _safe_int(level)
     if not sentence:
-        return None, readout(level, None, None, "type a sentence first")
-    y, sr = ENGINE.generate(sentence, voice_id, level, seed=int(seed))
-    # post-fx
+        return None, readout(level, None, None, "type a sentence first"), ""
+    y, sr, gen_text = ENGINE.generate(sentence, voice_id, level, seed=int(seed), mode=mode)
     if postfx_preset != "dry":
-        y_wet, _ = apply_post_fx(y, sr, preset=postfx_preset)
-        out_audio = y_wet
+        out_audio, _ = apply_post_fx(y, sr, preset=postfx_preset)
     else:
         out_audio = y
-    # metrics
-    wer = ENGINE.transcribe_wer(y, sr, sentence)
-    cos = None
-    if level != 0:
-        try:
-            ref_y, ref_sr = ENGINE.generate(sentence, voice_id, 0, seed=int(seed))
-            cos = ENGINE.voice_cosine(y, sr, ref_y, ref_sr)
-        except Exception:
-            cos = None
     path = _wav_to_filepath(out_audio, sr)
-    return path, readout(level, wer, cos, "ok")
+    # In Ghost mode the substituted lyric IS the artifact; show it. In Tongues mode the
+    # gen_text equals the source lyric — nothing useful to display.
+    readout_text = gen_text if (mode == MODE_GHOST and gen_text and gen_text != sentence) else ""
+    return path, readout(level, None, None, f"{mode.lower()} · lv{level}"), readout_text
 
 
-def morph(sentence: str, voice_id: str, postfx_preset: str, seed: int = 42, gap_ms: int = 250):
+def morph(sentence: str, voice_id: str, postfx_preset: str, mode: str,
+          seed: int = 42, gap_ms: int = 250):
     sentence = (sentence or "").strip()
     if not sentence:
-        return None, readout(None, None, None, "type a sentence first")
+        return None, readout(None, None, None, "type a sentence first"), ""
     clips = []
     for lv in range(5):
-        y, sr = ENGINE.generate(sentence, voice_id, lv, seed=int(seed))
+        y, sr, _ = ENGINE.generate(sentence, voice_id, lv, seed=int(seed), mode=mode)
         clips.append(y)
     morphed = equal_power_concat(clips, sr, fade_ms=gap_ms)
     if postfx_preset != "dry":
         morphed, _ = apply_post_fx(morphed, sr, preset=postfx_preset)
     path = _wav_to_filepath(morphed, sr)
-    return path, readout(None, None, None, "morphed 0->4")
+    return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), ""
 
 
-# ----- CSS (reused verbatim from prior app: dark theme, magenta accent, monospace readouts) -----
+# ----- CSS (dreamy pastel theme: half-remembered photograph of dusk) -----
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500&family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-    --bg-primary: #0a0a0f;
-    --bg-card: #14141c;
-    --bg-card-hover: #1a1a26;
-    --border: #2a2a3a;
-    --border-bright: #3a3a52;
-    --text-primary: #f5f5fa;
-    --text-secondary: #8a8a9a;
-    --text-muted: #5a5a6a;
-    --accent: #ff3d92;
-    --accent-glow: rgba(255, 61, 146, 0.35);
-    --accent-soft: rgba(255, 61, 146, 0.12);
+    --bg: #EFE6D8;
+    --bg-top: #B6BFD8;
+    --bg-mid: #D9A6A0;
+    --bg-bottom: #F2D6BD;
+    --surface: #F5ECDF;
+    --surface-soft: #EAD9C7;
+    --ink: #3C4266;
+    --ink-soft: #6B6E8A;
+    --ink-quiet: #8C8FA8;
+    --accent-rose: #D9A6A0;
+    --accent-sage: #A8B89A;
+    --accent-peach: #F2D6BD;
+    --accent-coral: #E78558;
+    --accent-wine: #503F52;
+    --halo-warm: #F4C7B0;
+    --halo-cool: #C8C4DE;
+    --hairline: rgba(60, 66, 102, 0.18);
 }
 
-body, .gradio-container, .dark {
-    background: var(--bg-primary) !important;
-    color: var(--text-primary) !important;
-    font-family: 'Inter', system-ui, sans-serif !important;
+body, .gradio-container, .dark, .light {
+    background:
+      radial-gradient(1200px 800px at 20% 8%, rgba(244,199,176,0.55), transparent 60%),
+      linear-gradient(180deg, var(--bg-top) 0%, var(--bg-mid) 45%, var(--bg-bottom) 100%) !important;
+    background-attachment: fixed !important;
+    color: var(--ink) !important;
+    font-family: 'EB Garamond', Georgia, serif !important;
 }
 
-.gradio-container {
-    max-width: 920px !important;
-    margin: 0 auto !important;
-    padding: 56px 24px 80px 24px !important;
+body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.235 0 0 0 0 0.258 0 0 0 0 0.4 0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    opacity: 0.14; mix-blend-mode: overlay;
 }
 
-#hero { text-align: center; margin-bottom: 40px; position: relative; }
-#hero::before {
-    content: ''; position: absolute; top: -40px; left: 50%; transform: translateX(-50%);
-    width: 240px; height: 240px;
-    background: radial-gradient(circle, var(--accent-soft) 0%, transparent 70%);
-    z-index: -1; pointer-events: none;
-}
+.gradio-container { max-width: 880px !important; margin: 0 auto !important; padding: 72px 28px 96px !important; position: relative; z-index: 1; }
+
+#hero { text-align: center; margin-bottom: 44px; }
 #hero h1 {
-    font-family: 'Space Grotesk', sans-serif; font-size: 72px; font-weight: 700;
-    letter-spacing: -0.045em; line-height: 0.95; margin: 0;
-    background: linear-gradient(180deg, #ffffff 0%, #888899 100%);
-    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    font-family: 'Fraunces', serif; font-variation-settings: 'opsz' 144, 'SOFT' 100;
+    font-style: italic; font-weight: 300; font-size: 76px;
+    letter-spacing: 0.04em; line-height: 1; margin: 0;
+    color: var(--ink); text-transform: lowercase;
 }
-#hero .tagline { font-size: 16px; color: var(--text-secondary); margin-top: 14px; max-width: 560px; margin-left: auto; margin-right: auto; }
-#hero .accent-line { display: inline-block; width: 48px; height: 3px; background: var(--accent); margin: 22px 0 0 0; border-radius: 2px; box-shadow: 0 0 20px var(--accent-glow); }
-
-label { color: var(--text-secondary) !important; font-size: 12px !important; font-weight: 500 !important; text-transform: uppercase !important; letter-spacing: 0.08em !important; font-family: 'JetBrains Mono', monospace !important; }
-
-input, textarea, select, .gr-input, .gr-text-input {
-    background: var(--bg-card) !important; border: 1px solid var(--border) !important;
-    color: var(--text-primary) !important; border-radius: 12px !important;
-    padding: 12px 16px !important; font-size: 14px !important; font-family: 'Inter', sans-serif !important;
+#hero .tagline {
+    font-family: 'EB Garamond', serif; font-style: italic; font-size: 18px;
+    color: var(--ink-soft); margin-top: 12px; max-width: 540px; margin-left: auto; margin-right: auto;
+    line-height: 1.5;
 }
-input:focus, textarea:focus, select:focus { border-color: var(--accent) !important; outline: none !important; }
+#hero .accent-line { display: inline-block; width: 64px; height: 1px; background: var(--ink-soft); opacity: 0.5; margin: 20px 0 0; }
 
-.gr-dropdown, [role="listbox"] { background: var(--bg-card) !important; border: 1px solid var(--border) !important; border-radius: 12px !important; }
-
-button.primary, button[variant="primary"], .primary > button {
-    background: var(--accent) !important; color: white !important; border: none !important;
-    padding: 14px 36px !important; font-weight: 600 !important; font-size: 15px !important;
-    border-radius: 12px !important; box-shadow: 0 0 32px var(--accent-glow) !important;
-    transition: transform 0.15s, box-shadow 0.15s !important; font-family: 'Inter', sans-serif !important;
+label, .gr-form > label, span[data-testid="block-info"] {
+    color: var(--ink-soft) !important;
+    font-family: 'EB Garamond', serif !important;
+    font-style: italic !important;
+    font-weight: 400 !important;
+    font-size: 13px !important;
+    letter-spacing: 0.04em !important;
+    text-transform: lowercase !important;
 }
-button.primary:hover { transform: translateY(-1px) !important; box-shadow: 0 0 48px var(--accent-glow) !important; }
 
-.gr-audio, audio { background: var(--bg-card) !important; border: 1px solid var(--border) !important; border-radius: 14px !important; }
+input, textarea, select,
+.gr-input, .gr-text-input, .gr-dropdown, [role="listbox"],
+.gr-box, .block {
+    background: var(--surface) !important;
+    border: 1px solid var(--hairline) !important;
+    color: var(--ink) !important;
+    border-radius: 14px !important;
+    font-family: 'EB Garamond', serif !important;
+    font-size: 15px !important;
+}
+textarea, input[type="text"], input[type="number"] {
+    padding: 12px 14px !important;
+}
+input:focus, textarea:focus, select:focus { border-color: var(--accent-coral) !important; outline: none !important; box-shadow: 0 0 0 3px rgba(231,133,88,0.18) !important; }
 
-.readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin-top: 14px; }
-.readout-cell { background: var(--bg-card); padding: 14px 12px; text-align: center; }
-.readout-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.16em; color: var(--text-muted); margin-bottom: 6px; }
-.readout-val { font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 500; color: var(--accent); letter-spacing: -0.02em; }
+button.primary, button[variant="primary"], .primary > button, button.lg {
+    background: transparent !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--ink-soft) !important;
+    padding: 12px 28px !important;
+    font-family: 'Fraunces', serif !important;
+    font-style: italic !important;
+    font-weight: 400 !important;
+    font-size: 16px !important;
+    border-radius: 999px !important;
+    box-shadow: none !important;
+    transition: background 0.18s, border-color 0.18s !important;
+}
+button.primary:hover, button[variant="primary"]:hover { background: rgba(60,66,102,0.06) !important; border-color: var(--ink) !important; }
 
-#footer { margin-top: 64px; padding-top: 28px; border-top: 1px solid var(--border); text-align: center; font-size: 12px; color: var(--text-muted); line-height: 1.7; }
-#footer a { color: var(--text-secondary); text-decoration: none; border-bottom: 1px solid var(--border); }
-#footer a:hover { color: var(--accent); }
+.gr-audio, audio { background: var(--surface) !important; border: 1px solid var(--hairline) !important; border-radius: 14px !important; }
+
+.readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-top: 18px; }
+.readout-cell { background: transparent; padding: 12px 8px; text-align: center; border-right: 1px solid var(--hairline); }
+.readout-cell:last-child { border-right: none; }
+.readout-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.18em; color: var(--ink-quiet); margin-bottom: 4px; text-transform: lowercase; }
+.readout-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 500; color: var(--ink); letter-spacing: -0.01em; }
+
+#footer {
+    margin-top: 72px; padding-top: 24px;
+    border-top: 1px solid var(--hairline);
+    text-align: center;
+    font-family: 'EB Garamond', serif; font-style: italic;
+    font-size: 12px; color: var(--ink-quiet);
+    line-height: 1.6;
+}
+
+.dial-label { display: none; }
+.gr-slider, [data-testid="slider"] { display: none !important; }
 
 @media (max-width: 720px) {
     #hero h1 { font-size: 48px !important; }
@@ -451,13 +541,19 @@ KNOB_JS = """
 }
 """
 
+STYLE_PRESETS = {
+    "dreamy":     "Goodman/Samarin glossolalia palette",
+    "hopelandic": "glide-led, high-front vowel chains (Sigur Rós register)",
+    "fraser":     "m/n/l onsets, open back vowels (Cocteau Twins register)",
+}
+
 with gr.Blocks(title="Glossolalia Dial") as demo:
     gr.HTML(
         """
         <div id="hero">
-            <h1>GLOSSOLALIA</h1>
-            <p class="tagline">Type a sentence. Pick a voice. Turn the dial.<br>
-            Hear it dissolve from speech to wordless tongues — in the same voice.</p>
+            <h1>glossolalia</h1>
+            <p class="tagline">type a sentence, pick a voice, turn the dial.<br>
+            hear it dissolve from speech to wordless tongues, in the same voice.</p>
             <div class="accent-line"></div>
         </div>
         """
@@ -465,21 +561,28 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
 
     with gr.Row():
         with gr.Column(scale=3):
-            sentence = gr.Textbox(label="Sentence", value=DEFAULT_TEXT, lines=2,
-                                  placeholder="type anything")
+            sentence = gr.Textbox(label="lyric", value=DEFAULT_TEXT, lines=2,
+                                  placeholder="anything")
         with gr.Column(scale=2):
             voice = gr.Dropdown([(v["name"], k) for k, v in VOICE_PRESETS.items()],
-                                value=DEFAULT_VOICE, label="Voice")
+                                value=DEFAULT_VOICE, label="voice")
+
+    with gr.Row():
+        mode = gr.Radio(
+            choices=list(MODES),
+            value=MODE_TONGUES,
+            label="mode",
+            info=(
+                "Ghost: real English words that sound like the source · "
+                "Tongues: invented pseudowords from the fine-tuned LoRA dial"
+            ),
+        )
 
     with gr.Row():
         with gr.Column(scale=3):
-            gr.HTML("<div class='dial-label'>PLAIN &nbsp;↔&nbsp; TONGUES &nbsp;(0 → 4)</div>")
-            level = gr.HTML(
-                value=0,
-                html_template=KNOB_HTML,
-                js_on_load=KNOB_JS,
-                elem_id="dial-knob",
-            )
+            gr.HTML(KNOB_HTML)
+            level = gr.Slider(0, 4, value=0, step=1, label="", elem_id="dial-slider", visible=True)
+            gr.HTML(f"<script>{KNOB_JS}</script>")
         with gr.Column(scale=2):
             postfx = gr.Dropdown(list(POSTFX_PRESETS.keys()), value="subtle",
                                  label="Post-FX (reverb · chorus · octave)")
@@ -490,16 +593,18 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
         morph_btn = gr.Button("Morph 0 → 4 (one continuous take)", variant="primary",
                               elem_classes="primary", scale=2)
 
-    audio_out = gr.Audio(label="Output", type="filepath", autoplay=False)
+    audio_out = gr.Audio(label="output", type="filepath", autoplay=False)
+    ghost_lyric = gr.Textbox(label="ghost lyric (deterministic substitution at current level)",
+                              interactive=False, lines=2)
     metrics = gr.HTML(readout())
 
     # twisting the knob just updates the readout; Speak button drives generation
     level.change(lambda lv: readout(level=_safe_int(lv)),
                  inputs=level, outputs=metrics)
-    speak_btn.click(speak, inputs=[sentence, voice, level, postfx, seed],
-                    outputs=[audio_out, metrics])
-    morph_btn.click(morph, inputs=[sentence, voice, postfx, seed],
-                    outputs=[audio_out, metrics])
+    speak_btn.click(speak, inputs=[sentence, voice, level, postfx, mode, seed],
+                    outputs=[audio_out, metrics, ghost_lyric])
+    morph_btn.click(morph, inputs=[sentence, voice, postfx, mode, seed],
+                    outputs=[audio_out, metrics, ghost_lyric])
 
     gr.HTML(
         """
@@ -514,4 +619,4 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(theme=_THEME, css=CUSTOM_CSS, show_api=False)
+    demo.launch(theme=_THEME, css=CUSTOM_CSS)

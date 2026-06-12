@@ -47,8 +47,9 @@ def main():
     p.add_argument("--max-sentences", type=int, default=500,
                    help="cap sentence count (default 500 for single-voice spike)")
     p.add_argument("--levels", type=int, default=5)
-    p.add_argument("--input-mode", choices=["pseudo", "ipa", "text"], default="pseudo",
-                   help="pseudo = corrupted English-like spelling (most TTS-friendly); ipa = corrupted IPA; text = no corruption (sanity)")
+    p.add_argument("--input-mode", choices=["pseudo", "ipa", "text", "mondegreen"], default="pseudo",
+                   help="pseudo/ipa = phoneme corruption (Tongues mode targets); mondegreen = "
+                        "real-English-words phonetic ghost (Ghost mode targets); text = no corruption.")
     p.add_argument("--seed-base", type=int, default=42)
     p.add_argument("--model", default="F5TTS_v1_Base", help="F5-TTS variant identifier")
     p.add_argument("--remove-silence", action="store_true")
@@ -72,6 +73,14 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from corrupt_phonemes import load_lm, corrupt_sentence, LEVEL_P
     lm = load_lm(Path(args.lm))
+
+    # Mondegreen index lazily loaded (only when --input-mode=mondegreen). Heavy: ~5s.
+    mondegreen_idx = None
+    if args.input_mode == "mondegreen":
+        from mondegreen import MondegreenIndex
+        cmu_path = Path(args.lm).parent / "cmudict.dict"
+        mondegreen_idx = MondegreenIndex(cmu_path)
+        print(f"Mondegreen index: {mondegreen_idx.size} words", file=sys.stderr)
 
     total = len(sentences) * len(voices) * args.levels
     print(f"Generating {total} clips: {len(sentences)} sentences x {len(voices)} voices x {args.levels} levels",
@@ -97,8 +106,10 @@ def main():
         for lv in range(args.levels):
             seed = args.seed_base + si * 31 + lv
             arpa, ipa, pseudo, display = corrupt_sentence(sentence, lv, lm, seed=seed)
+            mond = mondegreen_idx.substitute(sentence, lv, seed=seed) if mondegreen_idx else ""
             corrupted_by_level[lv] = {"arpabet": " ".join(t for t in arpa if t.strip()),
-                                      "ipa": ipa, "pseudo": pseudo, "display": display}
+                                      "ipa": ipa, "pseudo": pseudo, "display": display,
+                                      "mondegreen": mond}
 
         for voice in voices:
             for lv in range(args.levels):
@@ -111,7 +122,8 @@ def main():
                     continue
 
                 gen = corrupted_by_level[lv]
-                gen_text = {"pseudo": gen["pseudo"], "ipa": gen["ipa"], "text": sentence}[args.input_mode]
+                gen_text = {"pseudo": gen["pseudo"], "ipa": gen["ipa"],
+                            "text": sentence, "mondegreen": gen["mondegreen"]}[args.input_mode]
                 if not gen_text.strip():
                     continue
 
