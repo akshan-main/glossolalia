@@ -16,6 +16,7 @@ v1 Gradio app (gr.Blocks). v2 (Off-Brand badge) is in app_server.py.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -29,32 +30,158 @@ from config import (
 from scripts.post_fx import PRESETS as POSTFX_PRESETS, apply_post_fx
 
 
+def _parse_per_word_overrides(text: str) -> dict[str, tuple[str, float]]:
+    """Parse a string like 'river=ree-vuh:1.3 calm=kawm light=:1.6' into a dict:
+        { 'river': ('ree-vuh', 1.3), 'calm': ('kawm', 1.0), 'light': ('light', 1.6) }
+    The 'word=replacement:stretch' format is intentionally simple:
+      - word: the source word in the input lyric (case-insensitive)
+      - replacement: the pronunciation guide we feed to F5-TTS (empty -> keep original)
+      - stretch: a speed multiplier for THAT word's audio chunk (1.0 = normal,
+        <1.0 = faster, >1.0 = slower / more sustained). Default 1.0 if omitted.
+    """
+    out: dict[str, tuple[str, float]] = {}
+    for tok in (text or "").split():
+        if "=" not in tok:
+            continue
+        word, rest = tok.split("=", 1)
+        word = word.strip().lower()
+        if ":" in rest:
+            repl, sval = rest.split(":", 1)
+            try:
+                stretch = float(sval)
+            except ValueError:
+                stretch = 1.0
+        else:
+            repl, stretch = rest, 1.0
+        stretch = max(0.5, min(2.5, stretch))
+        out[word] = (repl.strip() if repl.strip() else word, stretch)
+    return out
+
+
+def _chunked_generate_with_overrides(
+        engine, sentence: str, voice_id: str, level: int, seed: int, mode: str,
+        custom_voice_path: str | None, custom_voice_text: str,
+        overrides: dict[str, tuple[str, float]]) -> tuple[np.ndarray, int, str]:
+    """Generate audio chunk-by-chunk so per-word stretch + pronunciation overrides apply.
+    Each chunk goes through F5-TTS at its own speed, then we equal-power concat.
+    Falls back to the single-shot path if no overrides are present."""
+    if not overrides:
+        return engine.generate(sentence, voice_id, level, seed=seed, mode=mode,
+                                custom_voice_path=custom_voice_path,
+                                custom_voice_text=custom_voice_text)
+    words = re.findall(r"[A-Za-z']+|[^A-Za-z']+", sentence)
+    chunks: list[tuple[str, float]] = []
+    for w in words:
+        key = w.lower().strip()
+        if key in overrides:
+            repl, stretch = overrides[key]
+            chunks.append((repl, stretch))
+        else:
+            chunks.append((w, 1.0))
+    # Merge adjacent chunks with stretch == 1.0 so we don't call F5-TTS 30 times for one sentence
+    merged: list[tuple[str, float]] = []
+    for text_part, st in chunks:
+        if merged and abs(merged[-1][1] - 1.0) < 1e-6 and abs(st - 1.0) < 1e-6:
+            merged[-1] = (merged[-1][0] + text_part, 1.0)
+        else:
+            merged.append((text_part, st))
+    # Generate each chunk
+    audios = []
+    sr_out = SAMPLE_RATE
+    last_gen_text_acc = ""
+    for text_part, stretch in merged:
+        if not text_part.strip():
+            continue
+        y, sr, gen_text = engine.generate(
+            text_part, voice_id, level, seed=seed, mode=mode,
+            custom_voice_path=custom_voice_path,
+            custom_voice_text=custom_voice_text,
+        )
+        sr_out = sr
+        if abs(stretch - 1.0) > 0.02:
+            try:
+                import librosa
+                y = librosa.effects.time_stretch(y.astype(np.float32), rate=1.0 / stretch)
+            except Exception as e:
+                print(f"[chunked] time_stretch failed for '{text_part}': {e}")
+        audios.append(y)
+        last_gen_text_acc += gen_text + " "
+    if not audios:
+        return engine.generate(sentence, voice_id, level, seed=seed, mode=mode,
+                                custom_voice_path=custom_voice_path,
+                                custom_voice_text=custom_voice_text)
+    final = equal_power_concat(audios, sr_out, fade_ms=80)
+    return final.astype(np.float32), sr_out, last_gen_text_acc.strip()
+
+
 def _blend_with_music(vocal: np.ndarray, vocal_sr: int, music_path: str,
                        vocal_gain_db: float = 0.0, music_gain_db: float = -8.0,
-                       tempo_lock: bool = True) -> tuple[np.ndarray, int]:
-    """Mix the TTS vocal over an uploaded music track.
+                       tempo_lock: bool = True, autotune: bool = True
+                       ) -> tuple[np.ndarray, int]:
+    """Mix the TTS vocal over an uploaded music track with TEMPO LOCK and AUTOTUNE.
 
-    - Detect music tempo via librosa.beat.beat_track
-    - Detect music key (rough) via chroma + Krumhansl-Schmuckler profile
-    - Optionally time-stretch the vocal so it lands in a tempo grid compatible with the music
-    - Sum the two streams; trim to the longer of (music length, vocal length)
-    - All local: librosa + numpy. Off-the-Grid stays clean.
+    Tempo lock:
+      - Detect music tempo via librosa.beat.beat_track
+      - Detect vocal "tempo" proxy from the speech onset rate
+      - Time-stretch the vocal to align (cap at +/-25% to keep formants).
+
+    Autotune (rough whole-clip pitch shift):
+      - Detect music's dominant pitch class via chroma_cqt average
+      - Detect vocal median f0 via librosa.yin
+      - Compute semitones from vocal_f0 to the nearest octave of the music's root note
+      - Pitch-shift the vocal by that many semitones (capped at +/-7 to avoid chipmunk)
+
+    All local: librosa + numpy. Off-the-Grid stays clean.
     """
     import librosa
+    import math
+
     music, music_sr = librosa.load(music_path, sr=vocal_sr, mono=True)
+
+    # --- tempo lock ---
     if tempo_lock and len(music) > vocal_sr * 2:
         try:
             mtempo, _ = librosa.beat.beat_track(y=music, sr=music_sr)
-            # estimate vocal speech "tempo" by syllable-rate proxy (rms onset rate)
             vtempo, _ = librosa.beat.beat_track(y=vocal, sr=vocal_sr)
             if mtempo and vtempo and abs(np.log2(mtempo / vtempo)) < 1.5:
-                # cap stretch at 25% in either direction to avoid robotic artifacts
                 ratio = float(np.clip(vtempo / mtempo, 0.78, 1.28))
                 if abs(ratio - 1.0) > 0.04:
                     vocal = librosa.effects.time_stretch(vocal, rate=ratio)
         except Exception as e:
-            print(f"[blend] tempo lock failed: {e}; mixing without stretch")
-    # Pad / truncate to the longer length
+            print(f"[blend] tempo lock failed: {e}")
+
+    # --- autotune: detect music root + pitch-shift vocal toward it ---
+    if autotune:
+        try:
+            # 12-bin chroma -> dominant pitch class is the music's key center
+            chroma = librosa.feature.chroma_cqt(y=music, sr=music_sr, hop_length=2048)
+            key_idx = int(np.argmax(chroma.mean(axis=1)))  # 0=C, 1=C#, ..., 11=B
+            key_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+            # vocal median f0 via YIN
+            f0 = librosa.yin(vocal.astype(np.float32),
+                             fmin=70, fmax=500, sr=vocal_sr, frame_length=2048)
+            f0 = f0[~np.isnan(f0) & (f0 > 0)]
+            if len(f0) > 5:
+                vocal_f0 = float(np.median(f0))
+                # music root note across plausible vocal octaves: 65.4 Hz (C2) .. 523 Hz (C5)
+                root_freqs = [
+                    27.5 * (2 ** ((key_idx - 9 + 12 * o) / 12.0))  # A0=27.5; key_idx 9 == A
+                    for o in range(2, 7)
+                ]
+                # pick the root octave closest in log-space to the vocal's median pitch
+                root = min(root_freqs, key=lambda r: abs(math.log2(r / vocal_f0)))
+                semitones = round(12 * math.log2(root / vocal_f0))
+                semitones = max(-7, min(7, semitones))
+                if semitones != 0:
+                    vocal = librosa.effects.pitch_shift(
+                        vocal.astype(np.float32), sr=vocal_sr, n_steps=semitones)
+                print(f"[blend] autotune: music key={key_names[key_idx]}, "
+                      f"vocal_f0={vocal_f0:.1f}Hz -> root={root:.1f}Hz, "
+                      f"shift {semitones} semitones")
+        except Exception as e:
+            print(f"[blend] autotune failed: {e}")
+
+    # --- mix ---
     n = max(len(music), len(vocal))
     if len(vocal) < n: vocal = np.pad(vocal, (0, n - len(vocal)))
     if len(music) < n: music = np.pad(music, (0, n - len(music)))
@@ -268,9 +395,9 @@ def _wav_to_filepath(y: np.ndarray, sr: int) -> str:
 def readout(level: int | None = None, wer: float | None = None,
             cosine: float | None = None, status: str = "") -> str:
     cells = [
-        ("DIAL", f"{level}" if level is not None else "—"),
-        ("WER", f"{wer:.2f}" if wer is not None else "—"),
-        ("VOICE-SIM", f"{cosine:.2f}" if cosine is not None else "—"),
+        ("DIAL", f"{level}" if level is not None else "·"),
+        ("WER", f"{wer:.2f}" if wer is not None else "·"),
+        ("VOICE-SIM", f"{cosine:.2f}" if cosine is not None else "·"),
         ("STATUS", status or ("live" if ENGINE.live else "stub")),
     ]
     return "<div class='readout'>" + "".join(
@@ -288,16 +415,43 @@ def _safe_int(v, lo: int = 0, hi: int = 4) -> int:
         return lo
 
 
+def _render_token_preview(lyric: str, overrides_text: str) -> str:
+    """Render the lyric as clickable gold token chips. Edited tokens show their override.
+    Python-driven: gets called on every lyric / overrides change so the markup stays in sync."""
+    overrides = _parse_per_word_overrides(overrides_text or "")
+    if not lyric or not lyric.strip():
+        return '<div class="token-row token-empty">type a lyric above; click any word here to hand-tune it</div>'
+    parts = re.findall(r"[A-Za-z']+|\s+|[^A-Za-z'\s]+", lyric)
+    pieces = []
+    for p in parts:
+        if not p:
+            continue
+        if not re.search(r"[A-Za-z]", p):
+            # whitespace / punctuation passes through, render \n as <br>
+            pieces.append(p.replace("\n", "<br>"))
+            continue
+        key = p.lower().strip("'")
+        if key in overrides:
+            repl, stretch = overrides[key]
+            label = f"{repl} ({stretch:.2f}x)"
+            pieces.append(f'<span class="token edited" data-word="{key}" data-pron="{repl}" '
+                          f'data-stretch="{stretch:.2f}" title="{label}">{p}</span>')
+        else:
+            pieces.append(f'<span class="token" data-word="{key}" data-pron="{p}" '
+                          f'data-stretch="1.00" title="click to hand-tune">{p}</span>')
+    return '<div class="token-row">' + "".join(pieces) + '</div>'
+
+
 def speak(sentence, voice_id, level, postfx_preset, mode, seed,
-          custom_voice, custom_voice_text, music_path, music_gain_db):
+          custom_voice, custom_voice_text, music_path, music_gain_db, overrides_text):
     sentence = (sentence or "").strip()
     level = _safe_int(level)
     if not sentence:
         return None, readout(level, None, None, "type a sentence first"), ""
-    y, sr, gen_text = ENGINE.generate(
-        sentence, voice_id, level, seed=int(seed), mode=mode,
-        custom_voice_path=custom_voice or None,
-        custom_voice_text=custom_voice_text or "",
+    overrides = _parse_per_word_overrides(overrides_text or "")
+    y, sr, gen_text = _chunked_generate_with_overrides(
+        ENGINE, sentence, voice_id, level, int(seed), mode,
+        custom_voice or None, custom_voice_text or "", overrides,
     )
     if postfx_preset != "dry":
         y, _ = apply_post_fx(y, sr, preset=postfx_preset)
@@ -315,38 +469,39 @@ def speak(sentence, voice_id, level, postfx_preset, mode, seed,
 
 
 def morph(sentence, voice_id, postfx_preset, mode, seed,
-          custom_voice, custom_voice_text, music_path, music_gain_db, gap_ms: int = 250):
+          custom_voice, custom_voice_text, music_path, music_gain_db,
+          overrides_text, gap_ms: int = 250):
     sentence = (sentence or "").strip()
     if not sentence:
         return None, readout(None, None, None, "type a sentence first"), ""
+    overrides = _parse_per_word_overrides(overrides_text or "")
     clips = []
+    sr_out = SAMPLE_RATE
     for lv in range(5):
-        y, sr, _ = ENGINE.generate(
-            sentence, voice_id, lv, seed=int(seed), mode=mode,
-            custom_voice_path=custom_voice or None,
-            custom_voice_text=custom_voice_text or "",
+        y, sr, _ = _chunked_generate_with_overrides(
+            ENGINE, sentence, voice_id, lv, int(seed), mode,
+            custom_voice or None, custom_voice_text or "", overrides,
         )
+        sr_out = sr
         clips.append(y)
-    morphed = equal_power_concat(clips, sr, fade_ms=gap_ms)
+    morphed = equal_power_concat(clips, sr_out, fade_ms=gap_ms)
     if postfx_preset != "dry":
-        morphed, _ = apply_post_fx(morphed, sr, preset=postfx_preset)
+        morphed, _ = apply_post_fx(morphed, sr_out, preset=postfx_preset)
     if music_path:
         try:
-            morphed, sr = _blend_with_music(morphed, sr, music_path,
-                                             vocal_gain_db=0.0,
-                                             music_gain_db=float(music_gain_db),
-                                             tempo_lock=True)
+            morphed, sr_out = _blend_with_music(morphed, sr_out, music_path,
+                                                  vocal_gain_db=0.0,
+                                                  music_gain_db=float(music_gain_db),
+                                                  tempo_lock=True)
         except Exception as e:
             print(f"[blend] failed: {e}; returning dry vocal")
-    path = _wav_to_filepath(morphed, sr)
+    path = _wav_to_filepath(morphed, sr_out)
     return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), ""
 
 
 # ----- CSS (dreamy pastel theme: half-remembered photograph of dusk) -----
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Pinyon+Script&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=IBM+Plex+Mono:wght@300;400;500&display=swap');
-
 /* HEAVEN OR LAS VEGAS — direct reference. Long-exposure Christmas lights, deep midnight
    violet background, hot red-orange sun in the lower-right hemisphere, gold light trails
    swooping diagonally. Title in hand-drawn flowing italic script (Pinyon Script ≈ the
@@ -384,8 +539,8 @@ html, body, .gradio-container, .dark, .light, gradio-app {
 /* THE SUN — fixed, lower-right, the focal hot red-orange sphere from the cover */
 .gradio-container::before {
     content: ''; position: fixed; z-index: 0; pointer-events: none;
-    right: -120px; bottom: -120px;
-    width: 720px; height: 720px;
+    right: -100px; bottom: -100px;
+    width: 560px; height: 560px;
     border-radius: 50%;
     background:
       radial-gradient(circle at 38% 32%,
@@ -422,7 +577,7 @@ body::before, gradio-app::before {
     opacity: 0.12; mix-blend-mode: overlay;
 }
 
-.gradio-container { max-width: 800px !important; margin: 0 auto !important; padding: 64px 32px 100px !important; position: relative; z-index: 1; }
+.gradio-container { max-width: 1040px !important; margin: 0 auto !important; padding: 72px 48px 120px !important; position: relative; z-index: 1; }
 
 /* -------------------- HERO -------------------- */
 
@@ -473,16 +628,33 @@ label, .gr-form > label, span[data-testid="block-info"], .label-wrap, label > sp
 }
 
 /* strip the default block chrome from EVERY gradio container so the page reads
-   as light + type + air, not stacked UI cards. */
+   as light + type + air, not stacked UI cards.
+   Aggressive: nuke any "block" class background + border + radius. */
 .block, .block-container, .form, .gradio-container > div > div,
-[data-testid="block"], .gr-form, .gr-box {
+[data-testid="block"], .gr-form, .gr-box,
+.svelte-vt1mxs, .svelte-1ipelgc, .gr-padded,
+[class*=" block"], [class^="block"],
+.svelte-633qhp, .svelte-1plpy97, .svelte-1mwvhlq,
+.gradio-container [class*="container"],
+.gradio-container [class*="form"] {
     background: transparent !important;
     border: none !important;
     box-shadow: none !important;
     border-radius: 0 !important;
-    padding: 0 !important;
 }
-.svelte-vt1mxs, .svelte-1ipelgc, .gr-padded { background: transparent !important; }
+/* leave the slider container with vertical padding so the slider track is visible */
+#dial-slider { padding: 18px 0 24px !important; }
+/* keep accordion content padded so the audio drop boxes don't collapse */
+[data-testid="accordion"] > div:nth-child(2),
+.gradio-container [class*="accordion"] > div:not(:first-child) {
+    padding: 16px 0 8px !important;
+}
+
+/* Rows: consistent gaps, vertical alignment */
+.gradio-container .gr-row, .gradio-container [class*="row"] {
+    gap: 28px !important;
+    align-items: end !important;
+}
 
 /* lyric textarea — handwriting on light, no card, just a hot gold underline */
 textarea {
@@ -548,7 +720,7 @@ input:focus, select:focus {
     color: var(--gold-bright) !important;
 }
 
-/* dropdown popup options — dark velvet so they read on the violet bg */
+/* dropdown popup options — dark backing so they read on the violet bg */
 [role="listbox"] [role="option"], .options ul li {
     background: rgba(14, 8, 32, 0.96) !important;
     color: var(--cream) !important;
@@ -653,98 +825,141 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
 }
 audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !important; }
 
-/* THE DIAL — focal luminous filament with a sun-orb thumb. Slider IS the dial. */
-#dial-frame {
-    margin: 28px 0 8px;
-    text-align: center;
+/* THE DIAL — brass knob with vermillion arc and a pointer needle.
+   Tick numbers sit in a semicircle above the knob: 0 on the left, 4 on the right. */
+#dial-stack {
+    display: flex; flex-direction: column; align-items: center;
+    margin: 32px 0 8px;
 }
 .dial-tag {
     font-family: 'IBM Plex Mono', monospace; font-size: 10px;
     color: var(--gold); letter-spacing: 0.34em; text-transform: uppercase;
-    opacity: 0.8; margin-bottom: 12px;
+    opacity: 0.8; margin-bottom: 28px;
 }
-.dial-ticks {
-    display: flex; justify-content: space-between;
-    font-family: 'Cormorant Garamond', serif; font-style: italic;
-    color: var(--cream-mute); font-size: 22px;
-    margin: 24px 6px 4px;
+.knob-stage {
+    position: relative;
+    width: 360px; height: 280px;
+    display: flex; align-items: flex-end; justify-content: center;
 }
-.dial-ticks span {
+/* Tick semicircle hugging the brass ring of the knob.
+   Positioned with its origin AT the knob center, so the JS polar coords are direct. */
+.knob-ticks {
+    position: absolute;
+    left: 50%;
+    bottom: 106px;   /* knob-wrap margin-bottom (16) + knob radius (90) = knob center */
+    width: 0; height: 0; pointer-events: none;
+}
+.knob-ticks span {
+    position: absolute;
+    left: 0; top: 0;
+    transform: translate(calc(var(--tx) - 50%), calc(var(--ty) - 50%));
     display: flex; flex-direction: column; align-items: center;
+    font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 19px; color: var(--cream-mute);
+    cursor: pointer; pointer-events: auto;
+    transition: color 0.22s, transform 0.22s;
     line-height: 1;
 }
-.dial-ticks span small {
+.knob-ticks span small {
     font-family: 'IBM Plex Mono', monospace; font-style: normal;
-    font-size: 9px; color: var(--cream-mute); opacity: 0.6;
+    font-size: 8px; color: var(--cream-mute); opacity: 0.55;
     letter-spacing: 0.22em; text-transform: uppercase;
-    margin-top: 8px;
+    margin-top: 4px; max-width: 80px; text-align: center;
 }
+.knob-ticks span.active {
+    color: var(--gold-bright); font-weight: 500; font-style: normal;
+    text-shadow: 0 0 12px var(--gold-glow);
+    transform: translate(calc(var(--tx) - 50%), calc(var(--ty) - 50%)) scale(1.22);
+}
+.knob-ticks span:hover { color: var(--gold-bright); }
 
-#dial-slider, [elem_id="dial-slider"] {
-    padding: 0 !important; margin: 0 !important;
-    background: transparent !important; border: none !important;
+/* Old-tech knob: knurled outer ring + flat dark face + thin cream indicator line.
+   Inspired by 1970s hi-fi tuner knobs (Marantz, Moog, Bakelite). */
+.knob-wrap {
+    position: relative;
+    width: 180px; height: 180px;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 16px;
+    filter: drop-shadow(0 10px 20px rgba(0,0,0,0.55));
 }
-#dial-slider > div, #dial-slider .wrap-inner { background: transparent !important; }
+.knob {
+    position: relative; z-index: 2;
+    width: 180px; height: 180px; border-radius: 50%;
+    cursor: grab; outline: none;
+    /* The flat face: warm walnut / dark Bakelite */
+    background:
+      radial-gradient(circle at 38% 32%,
+        rgba(255, 220, 175, 0.18) 0%,
+        rgba(255, 220, 175, 0.0) 28%),
+      radial-gradient(circle at 50% 50%,
+        #2C1B0E 0%, #1B0F08 70%, #100804 100%);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 220, 180, 0.1),
+      inset 0 -6px 12px rgba(0,0,0,0.55),
+      inset 0 4px 10px rgba(255, 220, 180, 0.08);
+    touch-action: none; user-select: none;
+    transition: filter 0.22s;
+}
+/* Knurled rim — fine repeating ridges in brass */
+.knob::before {
+    content: ''; position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
+    background: repeating-conic-gradient(
+      from 0deg,
+      #B89968 0deg 2deg,
+      #4A3618 2deg 4deg,
+      #8B6E3A 4deg 6deg
+    );
+    -webkit-mask: radial-gradient(circle, transparent 64px, #000 65px, #000 88px, transparent 89px);
+            mask: radial-gradient(circle, transparent 64px, #000 65px, #000 88px, transparent 89px);
+    filter: brightness(0.92);
+}
+/* Subtle inner highlight ring between knurled rim and flat face */
+.knob::after {
+    content: ''; position: absolute; inset: 12px; border-radius: 50%; pointer-events: none;
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 220, 180, 0.18),
+      inset 0 0 18px rgba(0,0,0,0.45);
+}
+.knob:focus-visible, .knob.dragging {
+    filter: brightness(1.04);
+}
+.knob.dragging { cursor: grabbing; }
+/* Faint gold arc around the rim showing dial position */
+.knob-arc {
+    position: absolute; z-index: 1; inset: -8px; border-radius: 50%; pointer-events: none;
+    background: conic-gradient(from 270deg,
+      var(--gold) 0deg,
+      var(--gold-bright) var(--arc-deg, 0deg),
+      transparent var(--arc-deg, 0deg) 180deg,
+      transparent 360deg);
+    -webkit-mask: radial-gradient(circle, transparent 96px, #000 97px, #000 102px, transparent 103px);
+            mask: radial-gradient(circle, transparent 96px, #000 97px, #000 102px, transparent 103px);
+    filter: drop-shadow(0 0 6px var(--gold-glow));
+    opacity: 0.85;
+}
+/* THE INDICATOR LINE — a thin cream line painted on the knob face, from center
+   to the edge of the knurled rim. Rotates with the knob value. */
+.knob-pointer {
+    position: absolute; z-index: 4;
+    left: 50%; top: 14px;
+    width: 4px; height: 60px;
+    margin-left: -2px;
+    background: linear-gradient(180deg, #FFF6D8 0%, #EFDBA8 80%, rgba(239, 219, 168, 0.0) 100%);
+    border-radius: 2px;
+    box-shadow:
+      0 0 6px rgba(255, 240, 200, 0.6),
+      0 0 14px rgba(255, 240, 200, 0.3),
+      inset 0 1px 0 rgba(255, 255, 240, 0.85);
+    transform-origin: 50% 76px;  /* pivot at the knob center (90 - 14) */
+    transform: rotate(var(--knob-angle, -90deg));
+    pointer-events: none;
+    transition: transform 0.24s cubic-bezier(.34,1.36,.4,1);
+}
+.knob-pin { display: none; }
 
-/* The actual rail: a horizontal filament glowing in gold. */
-input[type="range"] {
-    -webkit-appearance: none; appearance: none;
-    width: 100% !important; height: 6px !important;
-    background:
-      linear-gradient(90deg,
-        rgba(245, 197, 107, 0.85),
-        var(--gold-bright) 30%,
-        var(--gold) 60%,
-        rgba(245, 197, 107, 0.45)) !important;
-    border-radius: 999px !important;
-    outline: none !important;
-    box-shadow:
-      0 0 14px var(--gold-glow),
-      0 0 36px rgba(245, 197, 107, 0.25);
-    cursor: pointer;
-    margin: 6px 0 !important;
-}
-/* The thumb is the red-orange sun — large, glowing, the focal object */
-input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none; appearance: none;
-    width: 44px !important; height: 44px !important;
-    border-radius: 50%;
-    background:
-      radial-gradient(circle at 32% 30%, #FFE0B0 0%, var(--sun-mid) 28%,
-                       var(--sun-core) 60%, #8B2710 100%);
-    box-shadow:
-      0 0 18px rgba(255, 200, 120, 0.6),
-      0 0 38px var(--sun-halo),
-      0 0 80px rgba(255, 80, 40, 0.45),
-      inset 0 -4px 8px rgba(120, 20, 0, 0.5);
-    cursor: grab;
-    border: 1px solid rgba(245, 197, 107, 0.7);
-    margin-top: -19px;
-    transition: box-shadow 0.18s, transform 0.18s;
-}
-input[type="range"]::-webkit-slider-thumb:hover {
-    transform: scale(1.06);
-    box-shadow:
-      0 0 24px rgba(255, 220, 160, 0.8),
-      0 0 56px var(--sun-halo),
-      0 0 120px rgba(255, 80, 40, 0.55),
-      inset 0 -4px 8px rgba(120, 20, 0, 0.5);
-}
-input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; }
-
-input[type="range"]::-moz-range-thumb {
-    width: 44px; height: 44px; border-radius: 50%;
-    background:
-      radial-gradient(circle at 32% 30%, #FFE0B0 0%, var(--sun-mid) 28%,
-                       var(--sun-core) 60%, #8B2710 100%);
-    box-shadow:
-      0 0 18px rgba(255, 200, 120, 0.6),
-      0 0 38px var(--sun-halo),
-      0 0 80px rgba(255, 80, 40, 0.45),
-      inset 0 -4px 8px rgba(120, 20, 0, 0.5);
-    cursor: grab; border: 1px solid rgba(245, 197, 107, 0.7);
-}
-input[type="range"]::-moz-range-track { background: transparent; }
+/* Hide the actual gradio slider — the knob drives it via JS */
+#dial-slider { display: none !important; }
+#dial-slider .head, #dial-slider .slider_input_container { display: none !important; }
 
 /* readout — newspaper-strip-like, gold rule */
 .readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-top: 24px;
@@ -779,6 +994,67 @@ input[type="range"]::-moz-range-track { background: transparent; }
     opacity: 0.7;
 }
 
+/* per-word token chips + inline editor */
+#token-preview { margin-top: 6px; min-height: 40px; }
+.token-row {
+    line-height: 2.2; font-family: 'Cormorant Garamond', serif; font-style: italic;
+    font-size: 22px; color: var(--cream);
+}
+.token {
+    cursor: pointer; padding: 2px 4px; border-radius: 4px;
+    border-bottom: 1px dashed rgba(245, 197, 107, 0.32);
+    transition: background 0.18s, color 0.18s;
+}
+.token:hover { background: rgba(245, 197, 107, 0.14); color: var(--gold-bright); }
+.token.edited {
+    color: var(--gold-bright);
+    background: rgba(255, 80, 40, 0.18);
+    border-bottom: 1px solid var(--vermillion);
+    text-shadow: 0 0 12px var(--gold-glow);
+}
+.token-editor {
+    display: inline-block; vertical-align: middle;
+    background: rgba(14, 8, 32, 0.95); border: 1px solid var(--gold);
+    border-radius: 8px; padding: 12px 14px; margin: 6px 8px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.5), 0 0 0 2px rgba(245, 197, 107, 0.12);
+    color: var(--cream);
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 15px;
+    z-index: 12; position: relative;
+}
+.token-editor .te-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.token-editor .te-head { font-style: italic; color: var(--gold); border-bottom: 1px solid var(--hairline); padding-bottom: 6px; margin-bottom: 8px; }
+.token-editor .te-head b { color: var(--gold-bright); font-weight: 500; }
+.token-editor input.te-pron {
+    background: transparent !important; border: none !important;
+    border-bottom: 1px solid rgba(245, 197, 107, 0.4) !important;
+    color: var(--gold-bright) !important; font-style: italic !important;
+    font-size: 16px !important; padding: 4px 6px !important; min-width: 130px;
+}
+.token-editor input.te-stretch {
+    -webkit-appearance: none; appearance: none;
+    width: 150px; height: 3px; background: rgba(245, 197, 107, 0.32);
+    border-radius: 999px; outline: none; cursor: pointer;
+    box-shadow: 0 0 6px var(--gold-glow);
+}
+.token-editor input.te-stretch::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, var(--sun-mid), var(--sun-core));
+    box-shadow: 0 0 8px var(--sun-halo);
+    cursor: grab;
+}
+.token-editor .te-val { color: var(--cream-mute); min-width: 50px; text-align: right; font-size: 13px; }
+.token-editor .te-buttons { justify-content: flex-end; }
+.token-editor button {
+    background: transparent; border: 1px solid rgba(245, 197, 107, 0.42);
+    color: var(--cream); padding: 4px 14px; border-radius: 999px;
+    font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 14px;
+    cursor: pointer; transition: all 0.18s;
+}
+.token-editor button:hover { background: rgba(245, 197, 107, 0.18); color: var(--gold-bright); }
+.token-editor button.te-apply { border-color: var(--vermillion); color: var(--vermillion); }
+.token-editor button.te-apply:hover { background: var(--vermillion); color: var(--paper); }
+
 .dial-label { display: none; }
 
 /* hide the standard gradio header / footer chrome */
@@ -789,6 +1065,7 @@ input[type="range"]::-moz-range-track { background: transparent; }
     .gradio-container { padding: 36px 18px 64px !important; }
     textarea { font-size: 20px !important; }
 }
+
 """
 
 
@@ -986,14 +1263,17 @@ STYLE_PRESETS = {
 }
 
 with gr.Blocks(title="Glossolalia Dial") as demo:
+    # Inject fonts via <link> — Gradio's CSS-in-JS strips @import, so the stylesheet
+    # rule has to land in the document head as a tag, not in the CSS string.
     gr.HTML(
         """
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Pinyon+Script&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
         <div id="hero">
-            <div class="eyebrow">Volume I · Thousand Token Wood</div>
-            <h1>glossolalia<span class="dot">.</span></h1>
-            <p class="tagline">a single dial that grades your lyric from speech into wordless
-            tongues, in your own voice. two phonotactic paths, one melody.</p>
-            <div class="meta">A field study<br>in dreamy dissolution</div>
+            <h1>glossolalia</h1>
+            <p class="tagline">type a lyric. pick a voice. turn the dial.<br>
+            hear it dissolve into wordless tongues, in your own voice.</p>
         </div>
         """
     )
@@ -1017,7 +1297,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
             custom_voice = gr.Audio(
                 sources=["upload", "microphone"],
                 type="filepath",
-                label="reference clip — clean speech, no background music, 6-12 sec",
+                label="reference clip (clean speech, no background music, 6-12 sec)",
                 scale=2,
             )
             custom_voice_text = gr.Textbox(
@@ -1043,17 +1323,47 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                 scale=1,
             )
 
-    # the dial — focal luminous element (Gradio slider styled as glowing filament + sun orb)
+    # per-word overrides — stretch + pronunciation per individual word.
+    # Token preview HTML is Python-rendered on every lyric / state change so the markup
+    # is always in sync. JS only handles the click-to-edit popover and writes the new
+    # state back into the textbox below; Python then re-renders on that change.
+    with gr.Accordion("Hand-tune individual words (click any word to edit)",
+                      open=False, elem_id="overrides-accord"):
+        token_preview = gr.HTML(_render_token_preview(DEFAULT_TEXT, ""),
+                                 elem_id="token-preview")
+        overrides_text = gr.Textbox(
+            label="override state (the click-to-edit writes here; you can also type by hand)",
+            placeholder='advanced: word=pronunciation:stretch  e.g.  river=ree-vuh:1.4',
+            lines=1,
+            elem_id="overrides-state",
+            value="",
+        )
+        # Click-to-edit on .token chips. Gradio v6 strips inline <script> tags inside
+        # gr.HTML, so we register the delegated listener via demo.load(js=...) below.
+
+    # the dial — brass knob with vermillion arc and a Fraunces numeral center.
+    # Tick numbers sit in a semicircle above the knob (0 on the left, 4 on the right).
+    # The knob's indicator is a pointer needle that lines up with the active tick.
     gr.HTML(
         """
-        <div id="dial-frame">
+        <div id="dial-stack">
             <div class="dial-tag">the dial</div>
-            <div class="dial-ticks">
-                <span>0<small>clean</small></span>
-                <span>1</span>
-                <span>2<small>half-dissolved</small></span>
-                <span>3</span>
-                <span>4<small>tongues</small></span>
+            <div class="knob-stage">
+                <div class="knob-ticks" id="knob-ticks">
+                    <span data-lv="0">0</span>
+                    <span data-lv="1">1</span>
+                    <span data-lv="2">2</span>
+                    <span data-lv="3">3</span>
+                    <span data-lv="4">4</span>
+                </div>
+                <div class="knob-wrap">
+                    <div class="knob" id="knob" tabindex="0" role="slider"
+                         aria-valuemin="0" aria-valuemax="4" aria-valuenow="0">
+                        <div class="knob-arc"></div>
+                        <div class="knob-pointer"></div>
+                        <div class="knob-pin"></div>
+                    </div>
+                </div>
             </div>
         </div>
         """
@@ -1075,23 +1385,217 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                               elem_classes="primary", scale=1)
 
     audio_out = gr.Audio(label="the take", type="filepath", autoplay=False)
-    ghost_lyric = gr.Textbox(label="the ghost — the deterministic substitution at this dial",
+    ghost_lyric = gr.Textbox(label="the ghost (the deterministic substitution at this dial)",
                               interactive=False, lines=2,
                               elem_classes="ghost-lyric")
     metrics = gr.HTML(readout())
 
+    # Bind the brass knob to the hidden slider. Gradio strips inline <script> tags,
+    # so we inject this via demo.load(js=...) which runs once on page mount.
+    demo.load(
+        fn=None,
+        js="""() => {
+            const LEVELS = 5;
+            // 0 on the LEFT, 4 on the RIGHT, sweep over the TOP.
+            const ANGLE_MIN = -90, ANGLE_MAX = 90;
+            function getInp() { return document.querySelector('#dial-slider input[type="range"]'); }
+            function levelToAngle(level) {
+                const frac = level / (LEVELS - 1);
+                return ANGLE_MIN + (ANGLE_MAX - ANGLE_MIN) * frac;
+            }
+            function positionTicks() {
+                const ticks = document.querySelectorAll('.knob-ticks span');
+                // .knob-ticks is positioned at the knob center, so polar coords directly:
+                // tx = sin(angle)*R, ty = -cos(angle)*R. Knurled rim outer is at 88px, so
+                // a radius of 102 sits the tick just outside the rim.
+                const radius = 102;
+                ticks.forEach(t => {
+                    const lv = Number(t.dataset.lv);
+                    const angle = levelToAngle(lv);
+                    const rad = angle * Math.PI / 180;
+                    const tx = Math.sin(rad) * radius;
+                    const ty = -Math.cos(rad) * radius;
+                    t.style.setProperty('--tx', tx + 'px');
+                    t.style.setProperty('--ty', ty + 'px');
+                });
+            }
+            function render(level) {
+                const knob = document.getElementById('knob'); if (!knob) return;
+                const ticks = document.querySelectorAll('.knob-ticks span');
+                const angle = levelToAngle(level);
+                knob.style.setProperty('--knob-angle', angle + 'deg');
+                knob.style.setProperty('--arc-deg', (angle - ANGLE_MIN) + 'deg');
+                knob.setAttribute('aria-valuenow', level);
+                ticks.forEach(t => t.classList.toggle('active', Number(t.dataset.lv) === level));
+            }
+            function setLevel(level, fire) {
+                level = Math.max(0, Math.min(LEVELS - 1, Math.round(level)));
+                render(level);
+                if (fire) {
+                    const inp = getInp();
+                    if (inp) {
+                        inp.value = String(level);
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+            }
+            function bind() {
+                const knob = document.getElementById('knob');
+                const inp  = getInp();
+                if (!knob || !inp || knob.dataset.bound === '1') return !!knob && !!inp;
+                knob.dataset.bound = '1';
+                positionTicks();
+                render(parseInt(inp.value || '0', 10));
+                inp.addEventListener('input', () => render(parseInt(inp.value || '0', 10)));
+                // Rotational drag: convert pointer position to angle from knob center,
+                // map that angle into 0..(LEVELS-1).
+                let dragging = false;
+                function angleFromEvent(e) {
+                    const r = knob.getBoundingClientRect();
+                    const cx = r.left + r.width / 2;
+                    const cy = r.top + r.height / 2;
+                    // 0 deg = pointing up; clockwise positive (standard CSS rotation).
+                    let a = Math.atan2(e.clientX - cx, cy - e.clientY) * 180 / Math.PI;
+                    return a; // range -180..+180
+                }
+                function angleToLevel(a) {
+                    // ANGLE_MIN = -135 -> level 0, ANGLE_MAX = +135 -> level 4
+                    let clamped = Math.max(ANGLE_MIN, Math.min(ANGLE_MAX, a));
+                    const frac = (clamped - ANGLE_MIN) / (ANGLE_MAX - ANGLE_MIN);
+                    return Math.round(frac * (LEVELS - 1));
+                }
+                knob.addEventListener('pointerdown', e => {
+                    dragging = true;
+                    knob.setPointerCapture(e.pointerId);
+                    knob.classList.add('dragging');
+                    setLevel(angleToLevel(angleFromEvent(e)), true);
+                });
+                knob.addEventListener('pointermove', e => {
+                    if (!dragging) return;
+                    setLevel(angleToLevel(angleFromEvent(e)), true);
+                });
+                const end = e => {
+                    if (!dragging) return;
+                    dragging = false;
+                    try { knob.releasePointerCapture(e.pointerId); } catch(_) {}
+                    knob.classList.remove('dragging');
+                };
+                knob.addEventListener('pointerup', end);
+                knob.addEventListener('pointercancel', end);
+                knob.addEventListener('wheel', e => {
+                    e.preventDefault();
+                    setLevel(parseInt(inp.value || '0', 10) + (e.deltaY < 0 ? 1 : -1), true);
+                }, {passive: false});
+                knob.addEventListener('keydown', e => {
+                    const cur = parseInt(inp.value || '0', 10);
+                    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') { e.preventDefault(); setLevel(cur + 1, true); }
+                    else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') { e.preventDefault(); setLevel(cur - 1, true); }
+                });
+                document.querySelectorAll('.knob-ticks span').forEach(t => {
+                    t.addEventListener('click', () => setLevel(Number(t.dataset.lv), true));
+                });
+                return true;
+            }
+            // Gradio mounts components asynchronously; retry until both are present.
+            let n = 0;
+            const iv = setInterval(() => { if (bind() || ++n > 60) clearInterval(iv); }, 150);
+        }""",
+    )
+
+    # Click-to-edit on .token chips. Same demo.load(js=...) pattern as the knob —
+    # inline <script> in gr.HTML is stripped by Gradio v6.
+    demo.load(
+        fn=None,
+        js=r"""() => {
+            function getStateTA() {
+                const wrap = document.getElementById('overrides-state');
+                return wrap ? wrap.querySelector('textarea, input') : null;
+            }
+            function parseState(s) {
+                const out = {};
+                (s || '').trim().split(/\s+/).forEach(t => {
+                    if (!t.includes('=')) return;
+                    const [w, rest] = t.split('=', 2);
+                    let repl = rest, stretch = '1.0';
+                    if (rest && rest.includes(':')) { [repl, stretch] = rest.split(':', 2); }
+                    out[w.toLowerCase()] = { repl: repl || w, stretch: parseFloat(stretch) || 1.0 };
+                });
+                return out;
+            }
+            function serializeState(state) {
+                return Object.entries(state)
+                    .map(([w, v]) => `${w}=${v.repl}:${v.stretch.toFixed(2)}`)
+                    .join(' ');
+            }
+            function openEditor(anchor) {
+                const stateTA = getStateTA();
+                if (!stateTA) return;
+                const word = anchor.dataset.word;
+                const state = parseState(stateTA.value || '');
+                const cur = state[word] || {
+                    repl: anchor.dataset.pron || word,
+                    stretch: parseFloat(anchor.dataset.stretch || '1.0'),
+                };
+                const old = document.querySelector('.token-editor');
+                if (old) old.remove();
+                const ed = document.createElement('div');
+                ed.className = 'token-editor';
+                ed.innerHTML = `
+                    <div class="te-row te-head">editing <b>${word}</b></div>
+                    <label class="te-row">pronunciation <input class="te-pron" type="text" value="${cur.repl}"></label>
+                    <label class="te-row">stretch <span class="te-val">${cur.stretch.toFixed(2)}x</span>
+                        <input class="te-stretch" type="range" min="0.5" max="2.5" step="0.05" value="${cur.stretch}"></label>
+                    <div class="te-row te-buttons">
+                        <button type="button" class="te-clear">clear</button>
+                        <button type="button" class="te-apply">apply</button>
+                    </div>`;
+                anchor.insertAdjacentElement('afterend', ed);
+                const pron = ed.querySelector('.te-pron');
+                const sl = ed.querySelector('.te-stretch');
+                const val = ed.querySelector('.te-val');
+                sl.oninput = () => { val.textContent = parseFloat(sl.value).toFixed(2) + 'x'; };
+                ed.querySelector('.te-apply').onclick = () => {
+                    const ns = parseState(stateTA.value || '');
+                    ns[word] = { repl: pron.value || word, stretch: parseFloat(sl.value) };
+                    stateTA.value = serializeState(ns);
+                    stateTA.dispatchEvent(new Event('input', { bubbles: true }));
+                    ed.remove();
+                };
+                ed.querySelector('.te-clear').onclick = () => {
+                    const ns = parseState(stateTA.value || '');
+                    delete ns[word];
+                    stateTA.value = serializeState(ns);
+                    stateTA.dispatchEvent(new Event('input', { bubbles: true }));
+                    ed.remove();
+                };
+            }
+            // Delegate clicks: works even after Python re-renders the token preview.
+            document.addEventListener('click', e => {
+                const t = e.target.closest('#token-preview .token');
+                if (t) openEditor(t);
+            }, true);
+        }""",
+    )
+
     level.change(lambda lv: readout(level=_safe_int(lv)),
                  inputs=level, outputs=metrics)
+    sentence.change(_render_token_preview,
+                    inputs=[sentence, overrides_text], outputs=token_preview)
+    overrides_text.change(_render_token_preview,
+                          inputs=[sentence, overrides_text], outputs=token_preview)
     speak_btn.click(
         speak,
         inputs=[sentence, voice, level, postfx, mode, seed,
-                custom_voice, custom_voice_text, music_input, music_gain],
+                custom_voice, custom_voice_text,
+                music_input, music_gain, overrides_text],
         outputs=[audio_out, metrics, ghost_lyric],
     )
     morph_btn.click(
         morph,
         inputs=[sentence, voice, postfx, mode, seed,
-                custom_voice, custom_voice_text, music_input, music_gain],
+                custom_voice, custom_voice_text,
+                music_input, music_gain, overrides_text],
         outputs=[audio_out, metrics, ghost_lyric],
     )
 

@@ -54,10 +54,31 @@ def main():
     p.add_argument("--model", default="F5TTS_v1_Base", help="F5-TTS variant identifier")
     p.add_argument("--remove-silence", action="store_true")
     p.add_argument("--resume", action="store_true", help="skip clips whose wav already exists")
+    p.add_argument("--shard-idx", type=int, default=0,
+                   help="When parallelizing across N workers, this worker's shard index (0..N-1). Used "
+                        "to take sentences[shard_idx::shard_count] and to offset the clip index so "
+                        "filenames don't collide across workers.")
+    p.add_argument("--shard-count", type=int, default=1,
+                   help="Total number of parallel workers (default 1 = no sharding).")
     args = p.parse_args()
 
     # ---- inputs ----
     sentences = load_sentences(Path(args.sentences), args.max_sentences)
+    # Sharding: each worker takes a contiguous slice. We use CONTIGUOUS not strided
+    # so the global clip index for a given (worker, local_idx) is just
+    # `shard_idx * len(local_sentences) + local_idx`, which keeps filenames stable
+    # across reruns and lets --resume work after a cancel.
+    if args.shard_count > 1:
+        n = len(sentences)
+        per = (n + args.shard_count - 1) // args.shard_count  # ceil-div
+        start = args.shard_idx * per
+        end = min(start + per, n)
+        sentences = sentences[start:end]
+        clip_idx_offset = start * len(args.voice) * args.levels
+        print(f"  shard {args.shard_idx}/{args.shard_count}: sentences[{start}:{end}] ({len(sentences)} sents), "
+              f"clip_idx_offset={clip_idx_offset}", file=sys.stderr)
+    else:
+        clip_idx_offset = 0
     voices = []
     for v in args.voice:
         parts = v.split(":")
@@ -74,13 +95,20 @@ def main():
     from corrupt_phonemes import load_lm, corrupt_sentence, LEVEL_P
     lm = load_lm(Path(args.lm))
 
-    # Mondegreen index lazily loaded (only when --input-mode=mondegreen). Heavy: ~5s.
+    # Mondegreen index + DistilGPT-2 reranker (Ghost mode only). Heavy: ~5s + ~10s LM load.
+    # Without the reranker the independent path picks weighted by inverse phoneme distance
+    # alone, which surfaces rare CMUdict entries (surnames, archaic words). With the LM,
+    # common English wins by ~30 nats per token, so the output reads as ordinary speech.
     mondegreen_idx = None
+    mondegreen_reranker = None
     if args.input_mode == "mondegreen":
-        from mondegreen import MondegreenIndex
+        from mondegreen import MondegreenIndex, LMReranker
         cmu_path = Path(args.lm).parent / "cmudict.dict"
         mondegreen_idx = MondegreenIndex(cmu_path)
         print(f"Mondegreen index: {mondegreen_idx.size} words", file=sys.stderr)
+        print("Loading DistilGPT-2 reranker (CPU)...", file=sys.stderr)
+        mondegreen_reranker = LMReranker()
+        print("  reranker ready", file=sys.stderr)
 
     total = len(sentences) * len(voices) * args.levels
     print(f"Generating {total} clips: {len(sentences)} sentences x {len(voices)} voices x {args.levels} levels",
@@ -94,7 +122,10 @@ def main():
         sys.exit(1)
     tts = F5TTS(model=args.model)
 
-    manifest_path = out / "manifest.jsonl"
+    # Per-shard manifests so parallel workers don't clobber each other. The
+    # build_coherence_dataset.py step concatenates `manifest*.jsonl` at merge time.
+    manifest_name = f"manifest_shard{args.shard_idx}.jsonl" if args.shard_count > 1 else "manifest.jsonl"
+    manifest_path = out / manifest_name
     manifest_f = manifest_path.open("a" if args.resume else "w")
 
     idx = 0
@@ -106,14 +137,18 @@ def main():
         for lv in range(args.levels):
             seed = args.seed_base + si * 31 + lv
             arpa, ipa, pseudo, display = corrupt_sentence(sentence, lv, lm, seed=seed)
-            mond = mondegreen_idx.substitute(sentence, lv, seed=seed) if mondegreen_idx else ""
+            mond = mondegreen_idx.substitute(sentence, lv, seed=seed,
+                                              reranker=mondegreen_reranker) if mondegreen_idx else ""
             corrupted_by_level[lv] = {"arpabet": " ".join(t for t in arpa if t.strip()),
                                       "ipa": ipa, "pseudo": pseudo, "display": display,
                                       "mondegreen": mond}
 
         for voice in voices:
             for lv in range(args.levels):
-                name = f"clip_{idx:05d}_{voice['id']}_lv{lv}"
+                # Global clip index = local idx + shard offset, so each shard's filenames
+                # land in a non-overlapping range and the merged corpus is contiguous.
+                global_idx = clip_idx_offset + idx
+                name = f"clip_{global_idx:05d}_{voice['id']}_lv{lv}"
                 wav_path = out / f"{name}.wav"
                 meta_path = out / f"{name}.json"
                 idx += 1
