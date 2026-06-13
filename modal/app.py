@@ -58,6 +58,88 @@ image = (
 vol = modal.Volume.from_name("glossolalia-v5", create_if_missing=True)
 app = modal.App(APP_NAME, image=image)
 
+# Lightweight image for FLUX-schnell plate generation (no f5_tts / heavy audio stack)
+# Lets diffusers and transformers resolve compatible versions on their own (avoid pinning
+# transformers to 4.46.3 which lacks Dinov2WithRegistersConfig that recent diffusers needs).
+flux_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("git")
+    .pip_install(
+        "torch==2.6.0",       # FLUX-schnell prefers torch>=2.6
+        "diffusers==0.31.0",
+        "transformers>=4.45,<4.55",
+        "accelerate>=0.30",
+        "sentencepiece",
+        "protobuf",
+        "huggingface_hub",
+        "safetensors",
+        "Pillow",
+    )
+)
+
+
+@app.function(gpu="A10G", image=flux_image, volumes={"/vol": vol}, timeout=60 * 30)
+def gen_plates():
+    """Generate dreamy photographic background plates with SDXL-Turbo (non-gated, free).
+    Saves PNGs to /vol/plates/. Plates are bundled into the Space.
+    SDXL-Turbo: ~1-4 steps, 512x512 native, fast on A10G."""
+    import os
+    import torch
+    from diffusers import AutoPipelineForText2Image
+
+    os.makedirs("/vol/plates", exist_ok=True)
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        "stabilityai/sdxl-turbo",
+        torch_dtype=torch.float16,
+        variant="fp16",
+    ).to("cuda")
+    pipe.enable_attention_slicing()
+
+    prompts = {
+        "plate_sun":
+            "extreme close-up of a hot red-orange spherical sun-orb glowing in deep night, "
+            "soft photographic out-of-focus, dreamy 4AD record sleeve aesthetic, "
+            "warm rim light, deep violet background, hand-tinted analog photograph",
+        "plate_lights":
+            "long-exposure photograph of warm golden Christmas lights swooping in motion "
+            "across deep purple velvet background, ribbon of light, "
+            "dreamy ethereal, photographic, soft focus, no people, no text",
+        "plate_streaks":
+            "abstract photograph of golden ribbon light trails painted in the night, "
+            "deep violet to magenta gradient sky, swooping curves of warm yellow light, "
+            "analog film grain, 4AD record sleeve, dreamy",
+        "plate_velvet":
+            "photograph of deep velvet purple night with subtle painterly texture, "
+            "tiny floating warm light specks, ethereal, dreamy ambient backdrop, no figures",
+    }
+    saved = []
+    for name, prompt in prompts.items():
+        out_p = f"/vol/plates/{name}.png"
+        if os.path.exists(out_p):
+            print(f"  skip {name} (exists)")
+            saved.append(out_p)
+            continue
+        gen = torch.Generator("cuda").manual_seed(hash(name) & 0xFFFF)
+        img = pipe(
+            prompt,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            height=512,
+            width=1024,
+            generator=gen,
+        ).images[0]
+        img.save(out_p, format="PNG", optimize=True)
+        print(f"  saved {name}")
+        saved.append(out_p)
+    vol.commit()
+    print(f"plates: {saved}")
+
+
+@app.local_entrypoint()
+def make_plates():
+    gen_plates.remote()
+    print(">> plates on volume at /vol/plates")
+
 
 def _setup_repo():
     """Clone (or pull) the repo at runtime. Called at the top of every function."""
@@ -84,17 +166,10 @@ def dry_run():
     print("  dry_run PASS")
 
 
-@app.function(
-    gpu="A100-40GB",
-    volumes={"/vol": vol},
-    timeout=60 * 60,
-)
-def pull_and_generate():
-    """Pull data from HF + generate 200-clip training corpus. Idempotent (caches to volume)."""
-    import os, shutil, subprocess
+def _stage_inputs():
+    """Pull sentences + voices + phoneme LM from HF to local repo dir + /vol/voices."""
+    import os, shutil
     _setup_repo()
-
-    # Stage data inputs (small files, fine to re-pull each run)
     from huggingface_hub import snapshot_download
     p = snapshot_download(
         repo_id="akshan-main/glossolalia-inputs",
@@ -110,40 +185,69 @@ def pull_and_generate():
     if os.path.isdir(vd):
         for f in os.listdir(vd):
             shutil.copy(os.path.join(vd, f), f"{REPO_DIR}/data/voices/{f}")
-    print("  sentences:", sum(1 for _ in open(f"{REPO_DIR}/data/sentences.txt")))
-
-    # Mirror voices to volume so sweep_and_verify can read them
     os.makedirs("/vol/voices", exist_ok=True)
     for f in os.listdir(f"{REPO_DIR}/data/voices"):
         shutil.copy(f"{REPO_DIR}/data/voices/{f}", f"/vol/voices/{f}")
 
-    # Generate corpus (cached on volume — skip if already done)
+
+@app.function(
+    gpu="A100-40GB",
+    volumes={"/vol": vol},
+    timeout=60 * 60 * 12,
+)
+def pull_and_generate():
+    """Single-worker corpus gen (sequential). Pulls data, generates all 30k clips
+    on one A100, then builds the F5-TTS dataset. ~8h. See generate_chunk +
+    main_parallel for the 4-way fanout version."""
+    import os, shutil, subprocess
+    _stage_inputs()
+    print("  sentences:", sum(1 for _ in open(f"{REPO_DIR}/data/sentences.txt")))
+
     if os.path.isdir("/vol/coherence_ds") and os.path.exists("/vol/coherence_ds/metadata.csv"):
         print("  corpus already on volume, skipping generation")
         vol.commit()
         return
 
+    # Write clips DIRECTLY to /vol/coherence so partial progress persists across
+    # container restarts and the --resume flag actually works after a cancel.
+    os.makedirs("/vol/coherence", exist_ok=True)
     os.chdir(REPO_DIR)
-    subprocess.check_call([
-        "python", "scripts/generate_coherence_data.py",
-        "--sentences", "data/sentences.txt",
-        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
-        "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
-        "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
-        "--lm", "data/phoneme_lm.npz",
-        "--out", "data/coherence",
-        "--max-sentences", "500",
-        "--levels", "5",
-        "--input-mode", "pseudo",
-        "--resume",
-    ])
+
+    import threading, time
+    stop_commit = threading.Event()
+    def periodic_commit():
+        while not stop_commit.wait(300):  # commit every 5 minutes
+            try:
+                vol.commit()
+                print(f"  [commit] volume snapshot at {time.strftime('%H:%M:%S')}", flush=True)
+            except Exception as e:
+                print(f"  [commit] failed: {e}", flush=True)
+    commit_thread = threading.Thread(target=periodic_commit, daemon=True)
+    commit_thread.start()
+
+    try:
+        subprocess.check_call([
+            "python", "scripts/generate_coherence_data.py",
+            "--sentences", "data/sentences.txt",
+            "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+            "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
+            "--lm", "data/phoneme_lm.npz",
+            "--out", "/vol/coherence",
+            "--max-sentences", "3000",
+            "--levels", "5",
+            "--input-mode", "pseudo",
+            "--resume",
+        ])
+    finally:
+        stop_commit.set()
+        commit_thread.join(timeout=10)
+        vol.commit()
+
     subprocess.check_call([
         "python", "scripts/build_coherence_dataset.py",
-        "--data", "data/coherence",
-        "--out", "data/coherence_ds",
+        "--data", "/vol/coherence",
+        "--out", "/vol/coherence_ds",
     ])
-    shutil.copytree(f"{REPO_DIR}/data/coherence", "/vol/coherence", dirs_exist_ok=True)
-    shutil.copytree(f"{REPO_DIR}/data/coherence_ds", "/vol/coherence_ds", dirs_exist_ok=True)
     vol.commit()
     print("  corpus saved to volume")
 
@@ -151,7 +255,78 @@ def pull_and_generate():
 @app.function(
     gpu="A100-40GB",
     volumes={"/vol": vol},
-    timeout=60 * 60,
+    timeout=60 * 60 * 6,
+)
+def generate_chunk(shard_idx: int, shard_count: int = 4):
+    """One worker in the parallel corpus-gen fanout. Each worker takes a contiguous
+    slice of sentences (shard_idx of shard_count), writes clips with a non-overlapping
+    global index range to /vol/coherence, and emits its own manifest_shard{N}.jsonl.
+    The build step (run separately) globs all shard manifests and merges them."""
+    import os, shutil, subprocess, threading, time
+    _stage_inputs()
+    print(f"  sentences:", sum(1 for _ in open(f"{REPO_DIR}/data/sentences.txt")),
+          f"shard={shard_idx}/{shard_count}", flush=True)
+
+    os.makedirs("/vol/coherence", exist_ok=True)
+    os.chdir(REPO_DIR)
+
+    stop_commit = threading.Event()
+    def periodic_commit():
+        while not stop_commit.wait(300):
+            try:
+                vol.commit()
+                print(f"  [shard{shard_idx} commit] {time.strftime('%H:%M:%S')}", flush=True)
+            except Exception as e:
+                print(f"  [shard{shard_idx} commit] failed: {e}", flush=True)
+    commit_thread = threading.Thread(target=periodic_commit, daemon=True)
+    commit_thread.start()
+
+    try:
+        subprocess.check_call([
+            "python", "scripts/generate_coherence_data.py",
+            "--sentences", "data/sentences.txt",
+            "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
+            "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
+            "--lm", "data/phoneme_lm.npz",
+            "--out", "/vol/coherence",
+            "--max-sentences", "3000",
+            "--levels", "5",
+            "--input-mode", "pseudo",
+            "--resume",
+            "--shard-idx", str(shard_idx),
+            "--shard-count", str(shard_count),
+        ])
+    finally:
+        stop_commit.set()
+        commit_thread.join(timeout=10)
+        vol.commit()
+    print(f"  shard {shard_idx} done")
+
+
+@app.function(
+    gpu="A10G",
+    volumes={"/vol": vol},
+    timeout=60 * 30,
+)
+def build_dataset_after_fanout():
+    """Run AFTER all 4 generate_chunk workers complete. Globs all manifest_shard*.jsonl
+    files, merges into the F5-TTS finetune dataset format at /vol/coherence_ds."""
+    import os, subprocess
+    _setup_repo()
+    os.chdir(REPO_DIR)
+    subprocess.check_call([
+        "python", "scripts/build_coherence_dataset.py",
+        "--data", "/vol/coherence",
+        "--out", "/vol/coherence_ds",
+    ])
+    vol.commit()
+    print("  merged dataset saved to /vol/coherence_ds")
+
+
+@app.function(
+    gpu="A100-40GB",
+    volumes={"/vol": vol},
+    timeout=60 * 60 * 10,
 )
 def train_v5():
     """Train v5: LoRA on attention + attn_norm.linear, plus LevelEmbed MLP added to t."""
@@ -172,8 +347,8 @@ def train_v5():
     NUM_LEVELS = 5
     DIM = 1024
     BATCH = 4
-    # Sliders' ~1000-2000-step regime. Full-scale 7500 clips / batch 4 = 1875 steps per epoch.
-    # 2 epochs lands at 3750 steps, ~2x Sliders' 1000 floor.
+    # Sliders' ~1000-2000-step regime. Full-scale 30000 clips / batch 4 = 7500 steps per epoch.
+    # 2 epochs lands at 15000 steps, well above Sliders' 1000 floor (2-voice corpus, see DECISIONS.md).
     EPOCHS = 2
     LR_LORA = 2e-4     # Sliders config.yaml: AdamW 2e-4 bf16
     LEVEL_LR = 2e-3    # 10x LR_LORA: empirical, give zero-init MLP a chance to escape origin
@@ -435,7 +610,7 @@ def train_v5():
 @app.function(
     gpu="A100-40GB",
     volumes={"/vol": vol},
-    timeout=60 * 60,
+    timeout=60 * 60 * 6,
 )
 def sweep_and_verify():
     """Sweep dial 0..4 on 3 holdout sentences, spectral diff between dial=0 and dial=4."""
@@ -507,7 +682,7 @@ def sweep_and_verify():
 @app.function(
     gpu="A100-40GB",
     volumes={"/vol": vol},
-    timeout=60 * 60,
+    timeout=60 * 60 * 12,
 )
 def pull_and_generate_ghost():
     """v9: regenerate corpus with --input-mode=mondegreen for Ghost mode LoRA training.
@@ -546,12 +721,11 @@ def pull_and_generate_ghost():
     subprocess.check_call([
         "python", "scripts/generate_coherence_data.py",
         "--sentences", "data/sentences.txt",
-        "--voice", "v1:data/voices/v1.wav:data/voices/v1.txt",
         "--voice", "v2:data/voices/v2.wav:data/voices/v2.txt",
         "--voice", "v3:data/voices/v3.wav:data/voices/v3.txt",
         "--lm", "data/phoneme_lm.npz",
         "--out", "data/coherence_ghost",
-        "--max-sentences", "500",
+        "--max-sentences", "3000",
         "--levels", "5",
         "--input-mode", "mondegreen",
         "--resume",
@@ -569,15 +743,15 @@ def pull_and_generate_ghost():
 @app.function(
     gpu="A100-40GB",
     volumes={"/vol": vol},
-    timeout=60 * 60 * 2,
+    timeout=60 * 60 * 10,
 )
 def train_v9_ghost():
-    """v9 LoRA: same architecture as v8, trained on the Ghost-mode (mondegreen) corpus.
+    """v9 LoRA: DEPRECATED (2026-06-12). See DECISIONS.md "Ghost LoRA dropped" entry.
 
-    Sets V5_CORPUS_DIR, V5_OUT_DIR, V5_EPOCHS env vars before invoking train_v5
-    in-process via .local(). EPOCHS defaults to 2 if not overridden — at full-scale
-    7,500 clips / batch 4 = 1875 steps/epoch, so 2 epochs lands ~3750 steps, in the
-    Sliders 1000-2000-step regime with ~2x margin.
+    Ghost mode in app.py sets dial=0 at inference, so a Ghost LoRA never functionally
+    applies. Kept here only so the entrypoint stays callable if someone later switches
+    Ghost inference to set_dial(level). For now, the v9 corpus + adapter are NOT built
+    or shipped. Tongues mode (v8 LoRA) is the only trained adapter.
     """
     import os
     os.environ["V5_CORPUS_DIR"] = "/vol/coherence_ghost_ds"
@@ -588,14 +762,42 @@ def train_v9_ghost():
 
 @app.local_entrypoint()
 def main():
-    """Full-scale Tongues run: 500 sentences x 3 voices x 5 levels = 7,500 clips, 2 epochs."""
+    """Full-scale Tongues run: 3000 sentences x 2 voices x 5 levels = 30,000 clips, 2 epochs.
+    Sequential (single A100). Use main_parallel for 4-way fanout (~4x faster)."""
     import os
     os.environ.setdefault("V5_EPOCHS", "2")
-    print(">> step 1: pull data + generate corpus (Tongues = pseudo, 7500 clips)")
+    print(">> step 1: pull data + generate corpus (Tongues = pseudo, 30000 clips)")
     pull_and_generate.remote()
-    print("\n>> step 2: train v8 (Tongues mode, ~3750 steps)")
+    print("\n>> step 2: train v8 (Tongues mode)")
     train_v5.remote()
     print("\n>> step 3: sweep + spectral verify")
+    sweep_and_verify.remote()
+    print("\n>> done. Tongues adapter on volume at /vol/v5_adapter")
+
+
+@app.local_entrypoint()
+def main_parallel(num_shards: int = 4):
+    """Parallel Tongues run: fans out corpus generation across `num_shards` concurrent
+    A100 containers via Function.map(), each handling a contiguous slice of sentences.
+
+    Same 30,000-clip target as main. Wall-clock ~8h / num_shards for corpus, then
+    sequential build (~5 min) + training (~4h). Total cost stays roughly the same
+    (more containers, less time each). Default 4 shards: ~2h corpus + ~4h train.
+
+    Filenames carry a shard-aware global index so the merged corpus is contiguous;
+    each worker writes its own manifest_shard{N}.jsonl, which build_dataset_after_fanout
+    globs and merges before training."""
+    import os
+    os.environ.setdefault("V5_EPOCHS", "2")
+    print(f">> step 1: parallel corpus gen (Tongues, {num_shards} workers, ~30k clips)")
+    # starmap unpacks each tuple as positional args; blocks until all shards finish.
+    shard_args = [(i, num_shards) for i in range(num_shards)]
+    list(generate_chunk.starmap(shard_args))
+    print("\n>> step 2: merge shard manifests into F5-TTS finetune dataset")
+    build_dataset_after_fanout.remote()
+    print("\n>> step 3: train v8 (Tongues mode)")
+    train_v5.remote()
+    print("\n>> step 4: sweep + spectral verify")
     sweep_and_verify.remote()
     print("\n>> done. Tongues adapter on volume at /vol/v5_adapter")
 
@@ -615,9 +817,10 @@ def sweep_ghost():
 
 @app.local_entrypoint()
 def main_ghost():
-    """Full-scale Ghost run: 500 sentences x 3 voices x 5 levels = 7,500 clips, 2 epochs."""
-    print(">> step 1: pull data + generate corpus (Ghost = mondegreen, 7500 clips)")
+    """Full-scale Ghost run: 3000 sentences x 2 voices x 5 levels = 30,000 clips, 2 epochs.
+    Same 2-voice plan as v8 (v2 Karen Savage + v3 bass) for diversity. See DECISIONS.md."""
+    print(">> step 1: pull data + generate corpus (Ghost = mondegreen, 30000 clips)")
     pull_and_generate_ghost.remote()
-    print("\n>> step 2: train v9 (Ghost mode LoRA, ~3750 steps)")
+    print("\n>> step 2: train v9 (Ghost mode LoRA)")
     train_v9_ghost.remote()
     print("\n>> done. Ghost adapter on volume at /vol/v9_adapter")

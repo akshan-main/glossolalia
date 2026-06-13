@@ -35,9 +35,16 @@ def main():
     args = p.parse_args()
 
     data = Path(args.data); out = Path(args.out)
-    manifest_in = data / "manifest.jsonl"
-    if not manifest_in.exists():
-        print(f"missing {manifest_in}", file=sys.stderr); sys.exit(1)
+    # Accept both single-manifest layout and multi-shard (manifest_shard*.jsonl) layout.
+    # When shards are present we read them all so the parallel-fanout corpus is merged here.
+    manifest_files = sorted(data.glob("manifest_shard*.jsonl"))
+    if not manifest_files:
+        single = data / "manifest.jsonl"
+        if single.exists():
+            manifest_files = [single]
+    if not manifest_files:
+        print(f"missing manifest in {data}", file=sys.stderr); sys.exit(1)
+    print(f"reading {len(manifest_files)} manifest file(s)", file=sys.stderr)
 
     wavs_out = out / "wavs"
     wavs_out.mkdir(parents=True, exist_ok=True)
@@ -46,9 +53,13 @@ def main():
 
     rows = 0
     skipped = 0
-    with manifest_in.open() as f_in, csv_path.open("w") as f_csv, jsonl_path.open("w") as f_json:
+    with csv_path.open("w") as f_csv, jsonl_path.open("w") as f_json:
         f_csv.write("audio_path|text\n")
-        for line in f_in:
+        manifest_lines = []
+        for mf in manifest_files:
+            with mf.open() as f_in:
+                manifest_lines.extend(f_in.readlines())
+        for line in manifest_lines:
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
