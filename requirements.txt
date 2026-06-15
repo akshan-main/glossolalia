@@ -1,9 +1,15 @@
-gradio==6.15.2          # latest stable as of 2026-05-28; v2 uses gradio.Server (Gradio 6.x)
-gradio_client==2.5.0    # latest stable as of 2026-04-20
-torch
-torchaudio
+# torch/torchaudio 2.7: torchaudio.load() here decodes via the ffmpeg backend, NOT
+# torchcodec. That avoids the torchcodec<->CUDA version mismatch on the Space's GPU
+# (torchcodec 0.14 wants CUDA 13 / libnvrtc.so.13, but torch ships CUDA 12.8). ffmpeg
+# comes from packages.txt. f5-tts 1.1.20 still exposes the get_input_embed DiT API the
+# LoRA was trained against. README.md pins python_version: 3.11.
+torch==2.7.1
+torchaudio==2.7.1
+f5-tts==1.1.20
+peft==0.18.1
+gradio==6.10.0
+gradio_client==2.4.0
 transformers
-peft
 datasets
 huggingface_hub
 soundfile
@@ -15,7 +21,7 @@ panphon
 jiwer
 openai-whisper
 resemblyzer
-f5-tts
+wordfreq
 fastapi
 uvicorn
 pedalboard

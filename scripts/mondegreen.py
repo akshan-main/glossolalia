@@ -48,6 +48,7 @@ Design choices (no published precedent claimed):
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 import urllib.request
@@ -56,10 +57,29 @@ from typing import Iterable
 
 import numpy as np
 
+from wordfreq import zipf_frequency
+
+
+@functools.lru_cache(maxsize=200_000)
+def _zipf(word: str) -> float:
+    """Cached zipf frequency (log10 per-billion) of an English word; 0.0 if unknown."""
+    return zipf_frequency(word.replace("'", ""), "en")
+
 # ---- Constants ----
 
 LEVEL_P = [0.0, 0.25, 0.50, 0.75, 1.0]              # per-word substitution probability
-LEVEL_MAX_DIST = [0.0, 2.0, 4.0, 6.0, 8.0]          # PanPhon feature-edit-distance cap
+# PanPhon feature-edit-distance cap per level. The nearest real-word mishearing scales
+# with word length: short words ("sells") have one at distance ~1, but multi-syllable
+# words ("seashells", "seashore") have their nearest common-word mishearing at ~7-8.
+# So the cap must reach far enough at high levels or long words pass through unchanged
+# (the "dial 4 still says seashells" bug). Low levels stay tight = subtle, few changes;
+# lv4 (p=1.0, full dissolution) reaches 10 so every content word actually transforms.
+LEVEL_MAX_DIST = [0.0, 3.0, 5.0, 7.5, 10.0]
+
+# Minimum word-frequency (zipf scale, log10 per-billion) for a candidate to qualify.
+# CMUdict has ~135k entries including rare surnames / abbreviations ("selz" zipf 1.4).
+# zipf >= 2.5 keeps real mishearings ("seashells" 2.5, "reefer" 2.7) and rejects junk.
+MIN_CANDIDATE_ZIPF = 2.5
 
 CMUDICT_URL = "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.dict"
 
@@ -200,6 +220,10 @@ class MondegreenIndex:
         for cand in bucket:
             if cand == word or len(cand.replace("'", "")) <= 1:
                 continue
+            # Real-common-word gate: reject rare CMUdict entries (surnames,
+            # abbreviations, archaisms) so the ghost reads as ordinary English.
+            if _zipf(cand) < MIN_CANDIDATE_ZIPF:
+                continue
             d = float(self._dist.hamming_feature_edit_distance(
                 src_ipa, self._word_to_ipa[cand]) * 24.0)
             if d <= max_dist:
@@ -278,27 +302,48 @@ class MondegreenIndex:
     def _substitute_beam(self, sentence: str, level: int, seed: int,
                           reranker: "LMReranker",
                           beam_width: int, n_candidates_per_word: int) -> str:
-        rng = np.random.default_rng(seed)
         tokens = _TOKEN_RE.findall(sentence)
-        # Per-position candidate lists. None = pass-through token (whitespace/punct/function/OOV).
-        per_position: list[list[tuple[str, float]] | None] = []
-        for tok in tokens:
+        # COUNT-BASED, MONOTONIC selection (replaces probabilistic per-word firing, which
+        # left short sentences unchanged at low dials so levels 0/1/2 looked identical).
+        # The level controls HOW MANY content words change; each changed word takes its
+        # nearest real-word mishearing. Word priority = closest-mishearing first, so the
+        # most natural swaps appear at low dials and higher dials nest more on top.
+        substitutable: list[int] = []     # token indices eligible for substitution
+        best_dist: dict[int, float] = {}  # index -> distance of its nearest candidate
+        cand_cache: dict[int, list[tuple[str, float]]] = {}
+        for i, tok in enumerate(tokens):
             if not tok.replace("'", "").isalpha():
-                per_position.append(None)
                 continue
             low = tok.lower()
-            if low in _FUNCTION_WORDS or level <= 0:
-                per_position.append(None)
+            if low in _FUNCTION_WORDS:
                 continue
-            if rng.random() >= LEVEL_P[level]:
-                per_position.append(None)
-                continue
-            cands = self.find_candidates(low, max_dist=LEVEL_MAX_DIST[level],
-                                          max_results=n_candidates_per_word)
+            # Generous cap (12): once we DECIDE to change a word, it should always find
+            # its nearest real-word mishearing regardless of word length. The level
+            # gates the COUNT of changes, not the per-word distance.
+            cands = self.find_candidates(low, max_dist=12.0, max_results=n_candidates_per_word)
             if not cands:
-                per_position.append(None)
                 continue
-            per_position.append(cands)
+            substitutable.append(i)
+            best_dist[i] = cands[0][1]
+            cand_cache[i] = cands
+
+        # How many of the eligible words to substitute at this level (monotonic: 0,1,...,N).
+        n_elig = len(substitutable)
+        if level <= 0 or n_elig == 0:
+            k = 0
+        elif level >= len(LEVEL_P) - 1:
+            k = n_elig                       # top level: change everything eligible
+        else:
+            import math as _math
+            k = min(n_elig, max(1, _math.ceil(LEVEL_P[level] * n_elig)))
+        # Pick the k words with the closest (most convincing) mishearings; tie-break by
+        # position so the choice is deterministic and nests as the dial rises.
+        chosen = sorted(substitutable, key=lambda i: (best_dist[i], i))[:k]
+        chosen_set = set(chosen)
+
+        per_position: list[list[tuple[str, float]] | None] = []
+        for i, tok in enumerate(tokens):
+            per_position.append(cand_cache[i] if i in chosen_set else None)
 
         # Beam search. Each beam = (sequence_so_far: list[str], cumulative_log_prob: float).
         beams: list[tuple[list[str], float]] = [([], 0.0)]
@@ -310,7 +355,12 @@ class MondegreenIndex:
                 continue
             expanded: list[tuple[list[str], float]] = []
             for beam, score in beams:
+                used = {w.lower() for w in beam}   # words already chosen in this beam
                 for cand_word, cand_dist in cands:
+                    # Dedup: don't let the same substitute word repeat in one sentence
+                    # (the "cecil ... cecil" bug). Skip if already used in this beam.
+                    if cand_word.lower() in used:
+                        continue
                     new_seq = beam + [cand_word]
                     # Score the partial sequence's last-token log-prob under the LM.
                     # Reuses prefix cache internally; this is fast.
@@ -319,6 +369,10 @@ class MondegreenIndex:
                     # Tie-breaker: phonetic distance (lower = better), then alphabetical.
                     tb = (-cand_dist * 1e-6, -ord(cand_word[0]) * 1e-9)
                     expanded.append((new_seq, score + lm_score + tb[0] + tb[1]))
+            if not expanded:
+                # Every candidate collided with an already-used word; keep the source.
+                beams = [(beam + [src_tok], score) for beam, score in beams]
+                continue
             # Stable sort by score descending; on tie, earlier item wins (Python sort is stable).
             expanded.sort(key=lambda x: -x[1])
             beams = expanded[:beam_width]

@@ -23,6 +23,22 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 
+# ZeroGPU support (org Space). `spaces` is only installed on the ZeroGPU deployment;
+# where it's absent (the T4 Space, local dev) gpu_task is a no-op pass-through, so the
+# SAME app.py runs on both. On ZeroGPU it allocates a transient GPU for each call.
+try:
+    import spaces
+
+    _ON_ZEROGPU = True
+
+    def gpu_task(fn):
+        return spaces.GPU(duration=120)(fn)
+except Exception:
+    _ON_ZEROGPU = False
+
+    def gpu_task(fn):
+        return fn
+
 from config import (
     CONTROL_STEM, HF_LORA_REPO, LEVEL_WORDS, RESEMBLYZER_MIN_COSINE,
     SAMPLE_RATE, VOICE_PRESETS, WHISPER_MODEL,
@@ -195,7 +211,7 @@ def _blend_with_music(vocal: np.ndarray, vocal_sr: int, music_path: str,
 
 VOICE_IDS = list(VOICE_PRESETS.keys())
 DEFAULT_VOICE = VOICE_IDS[0] if VOICE_IDS else "v1"
-DEFAULT_TEXT = "the river was wide and calm in the morning light"
+DEFAULT_TEXT = "she sells seashells by the seashore"
 # default to the published LoRA repo so the Space loads it without needing env vars;
 # COHERENCE_DIAL_LORA env var overrides for local dev against a checkpoint dir.
 LORA_PATH = os.environ.get("COHERENCE_DIAL_LORA", HF_LORA_REPO)
@@ -253,9 +269,12 @@ class TTSEngine:
         try:
             import patches  # noqa: F401 — installs F5TTS.load_lora before instantiation
             from f5_tts.api import F5TTS
+            # Lazy-loaded inside generate(), which on ZeroGPU runs under @spaces.GPU, so
+            # F5-TTS's auto device detection picks the allocated GPU. (On the T4 Space it
+            # loads to cuda directly; locally it falls back to CPU.)
             self._tts = F5TTS(model="F5TTS_v1_Base")
             self.live = True
-            print(f"[engine] F5-TTS base loaded (model=F5TTS_v1_Base)")
+            print(f"[engine] F5-TTS base loaded (device={self._tts.device})")
             if LORA_PATH:
                 try:
                     self._tts.load_lora(LORA_PATH)
@@ -301,8 +320,31 @@ class TTSEngine:
         """
         self._ensure()
         if custom_voice_path:
-            voice_wav = custom_voice_path
+            # The uploaded/recorded clip may be mp3/m4a/etc. Our soundfile reader (and a
+            # clean F5-TTS clone) want a 24kHz mono WAV, so transcode it first via librosa
+            # (handles many formats through ffmpeg). Trim to <=15s to keep cloning fast.
+            try:
+                import librosa, soundfile as sf
+                ref, _ = librosa.load(custom_voice_path, sr=24000, mono=True)
+                ref = ref[: 24000 * 15]
+                tmp_ref = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                sf.write(tmp_ref, ref, 24000, subtype="PCM_16")
+                voice_wav = tmp_ref
+            except Exception as e:
+                print(f"[engine] custom voice transcode failed ({e}); using raw path")
+                voice_wav = custom_voice_path
             voice_ref_text = (custom_voice_text or "").strip()
+            # F5-TTS needs a transcript of the reference. If the user left it blank,
+            # transcribe the clip ourselves so cloning is reliable instead of depending
+            # on F5-TTS's internal auto-transcribe path.
+            if not voice_ref_text:
+                asr = self._ensure_asr()
+                if asr:
+                    try:
+                        voice_ref_text = asr.transcribe(voice_wav)["text"].strip()
+                        print(f"[engine] auto-transcribed clone ref: {voice_ref_text[:60]!r}")
+                    except Exception as e:
+                        print(f"[engine] clone ref transcribe failed: {e}")
         else:
             voice = VOICE_PRESETS[voice_id]
             voice_wav = voice["wav"]
@@ -442,18 +484,12 @@ def _render_token_preview(lyric: str, overrides_text: str) -> str:
     return '<div class="token-row">' + "".join(pieces) + '</div>'
 
 
-def speak(sentence, voice_id, level, postfx_preset, mode, seed,
-          custom_voice, custom_voice_text, music_path, music_gain_db, overrides_text):
-    sentence = (sentence or "").strip()
-    level = _safe_int(level)
-    if not sentence:
-        return None, readout(level, None, None, "type a sentence first"), ""
-    overrides = _parse_per_word_overrides(overrides_text or "")
-    y, sr, gen_text = _chunked_generate_with_overrides(
-        ENGINE, sentence, voice_id, level, int(seed), mode,
-        custom_voice or None, custom_voice_text or "", overrides,
-    )
-    if postfx_preset != "dry":
+def _apply_output_fx(y_dry, sr, postfx_preset, music_path, music_gain_db):
+    """Cheap post-generation DSP: post-fx bus + optional music blend (CPU only, NOT
+    @gpu_task). Kept separate from F5-TTS generation so changing post-fx / music
+    re-renders instantly from the cached dry voice instead of re-running the neural net."""
+    y = y_dry
+    if postfx_preset and postfx_preset != "dry":
         y, _ = apply_post_fx(y, sr, preset=postfx_preset)
     if music_path:
         try:
@@ -463,17 +499,38 @@ def speak(sentence, voice_id, level, postfx_preset, mode, seed,
                                        tempo_lock=True)
         except Exception as e:
             print(f"[blend] failed: {e}; returning dry vocal")
-    path = _wav_to_filepath(y, sr)
+    return _wav_to_filepath(y, sr)
+
+
+@gpu_task
+def speak(sentence, voice_id, level, postfx_preset, mode, seed,
+          custom_voice, custom_voice_text, music_path, music_gain_db, overrides_text):
+    sentence = (sentence or "").strip()
+    level = _safe_int(level)
+    if not sentence:
+        return None, readout(level, None, None, "type a sentence first"), "", None
+    overrides = _parse_per_word_overrides(overrides_text or "")
+    y, sr, gen_text = _chunked_generate_with_overrides(
+        ENGINE, sentence, voice_id, level, int(seed), mode,
+        custom_voice or None, custom_voice_text or "", overrides,
+    )
+    # Save the DRY voice to its own file and cache the PATH (a cheap string), so post-fx /
+    # music changes re-render from it without re-inference. We cache a path rather than the
+    # raw array because speak runs in ZeroGPU's forked GPU worker and its return values are
+    # serialized back across the process boundary; a path is trivial to pass, an array isn't.
+    dry_path = _wav_to_filepath(y, sr)
+    path = _apply_output_fx(y, sr, postfx_preset, music_path, music_gain_db)
     readout_text = gen_text if (mode == MODE_GHOST and gen_text and gen_text != sentence) else ""
-    return path, readout(level, None, None, f"{mode.lower()} · lv{level}"), readout_text
+    return path, readout(level, None, None, f"{mode.lower()} · lv{level}"), readout_text, dry_path
 
 
+@gpu_task
 def morph(sentence, voice_id, postfx_preset, mode, seed,
           custom_voice, custom_voice_text, music_path, music_gain_db,
           overrides_text, gap_ms: int = 250):
     sentence = (sentence or "").strip()
     if not sentence:
-        return None, readout(None, None, None, "type a sentence first"), ""
+        return None, readout(None, None, None, "type a sentence first"), "", None
     overrides = _parse_per_word_overrides(overrides_text or "")
     clips = []
     sr_out = SAMPLE_RATE
@@ -485,18 +542,23 @@ def morph(sentence, voice_id, postfx_preset, mode, seed,
         sr_out = sr
         clips.append(y)
     morphed = equal_power_concat(clips, sr_out, fade_ms=gap_ms)
-    if postfx_preset != "dry":
-        morphed, _ = apply_post_fx(morphed, sr_out, preset=postfx_preset)
-    if music_path:
-        try:
-            morphed, sr_out = _blend_with_music(morphed, sr_out, music_path,
-                                                  vocal_gain_db=0.0,
-                                                  music_gain_db=float(music_gain_db),
-                                                  tempo_lock=True)
-        except Exception as e:
-            print(f"[blend] failed: {e}; returning dry vocal")
-    path = _wav_to_filepath(morphed, sr_out)
-    return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), ""
+    dry_path = _wav_to_filepath(morphed, sr_out)
+    path = _apply_output_fx(morphed, sr_out, postfx_preset, music_path, music_gain_db)
+    return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), "", dry_path
+
+
+def reapply_fx(dry_path, postfx_preset, music_path, music_gain_db):
+    """Re-render the output from the cached DRY voice file when post-fx / music changes,
+    so the user hears the effect immediately without re-running F5-TTS. Nothing generated
+    yet (no cached path) -> leave the player as-is. Pure CPU DSP, NOT @gpu_task."""
+    if not dry_path:
+        return gr.update()
+    try:
+        import soundfile as sf
+        y, sr = sf.read(str(dry_path), dtype="float32")
+    except Exception:
+        return gr.update()
+    return _apply_output_fx(y, sr, postfx_preset, music_path, music_gain_db)
 
 
 # ----- CSS (dreamy pastel theme: half-remembered photograph of dusk) -----
@@ -515,67 +577,103 @@ CUSTOM_CSS = """
     --sun-core: #FF4D2C;
     --sun-mid: #FF7A3D;
     --sun-halo: rgba(255, 120, 60, 0.55);
-    --gold: #F5C56B;
-    --gold-bright: #FFDB8A;
-    --gold-glow: rgba(245, 197, 107, 0.42);
-    --cream: #F3E7C3;
-    --cream-mute: #D6C998;
-    --ink-light: #E8DBB3;
-    --ink-mute: #A89A6A;
-    --hairline: rgba(245, 197, 107, 0.22);
+    --gold: #FFD66B;            /* brighter, more saturated for higher contrast on violet AND on the sun side */
+    --gold-bright: #FFE9A3;
+    --gold-glow: rgba(255, 214, 107, 0.6);
+    --cream: #FFEFC9;
+    --cream-mute: #E8D9A0;
+    --ink-light: #FFE9B8;
+    --ink-mute: #BFAD78;
+    --hairline: rgba(255, 214, 107, 0.32);
 }
 
-html, body, .gradio-container, .dark, .light, gradio-app {
-    background:
-      /* deep violet wash with night gradient */
-      radial-gradient(1400px 900px at 30% 18%, var(--violet-glow) 0%, var(--violet) 32%,
-                       var(--night) 72%, var(--night-deep) 100%) !important;
-    background-attachment: fixed !important;
+/* BASE: NO opaque ancestor backgrounds (gradio-app + body default to opaque dark and
+   would paint over a background layer), and NO background-attachment:fixed (jank on
+   scroll, ignored on iOS Safari). The dark base + sun live on the injected #bg-sun
+   layer only. Verified: no ancestor sets transform/filter/will-change/contain, so a
+   position:fixed child of <body> anchors to the viewport and is never clipped. */
+html, body, gradio-app, .gradio-container, .dark, .light {
+    background: transparent !important;
     color: var(--ink-light) !important;
     font-family: 'Cormorant Garamond', Georgia, serif !important;
     min-height: 100vh;
 }
+/* Solid dark on <body> so first paint (before the JS mounts #bg-sun) shows no flash. */
+body { background: var(--night) !important; }
 
-/* THE SUN — fixed, lower-right, the focal hot red-orange sphere from the cover */
-.gradio-container::before {
-    content: ''; position: fixed; z-index: 0; pointer-events: none;
-    right: -100px; bottom: -100px;
-    width: 560px; height: 560px;
-    border-radius: 50%;
+/* THE FIXED SUN LAYER: a real <div id="bg-sun"> prepended to <body> by demo.load(js).
+   position:fixed + inset:0 => pinned to the viewport, never scrolls, never clipped.
+   The sun is a DEFINED ~560px circular ball tucked into the bottom-right corner
+   (a `circle 280px` radial-gradient = 560px diameter), centered ~150px past the corner
+   so most of the ball is visible like a little sun, fading cleanly to the dark base.
+   NO giant viewport-wide wash. translateZ(0) = own GPU layer, no repaint on scroll. */
+#bg-sun {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
     background:
-      radial-gradient(circle at 38% 32%,
+      radial-gradient(circle 420px at calc(100% - 160px) calc(100% - 160px),
         #FFE7B0 0%,
-        #FFB070 12%,
-        var(--sun-core) 28%,
-        #C7311A 52%,
-        #6B1808 78%,
-        transparent 100%);
-    filter: blur(8px);
-    opacity: 0.92;
-    box-shadow:
-      0 0 220px 60px rgba(255, 120, 60, 0.45),
-      0 0 460px 120px rgba(255, 80, 40, 0.22);
-    animation: sunBreath 14s ease-in-out infinite alternate;
-}
-@keyframes sunBreath {
-    0%   { transform: translate(0, 0) scale(1.00); opacity: 0.88; }
-    100% { transform: translate(-18px, -8px) scale(1.06); opacity: 0.96; }
+        #FFB070 14%,
+        #FF7A3D 30%,
+        var(--sun-core) 46%,
+        #C7311A 64%,
+        rgba(107, 24, 8, 0.45) 82%,
+        transparent 100%),
+      var(--night);
+    transform: translateZ(0);
 }
 
-/* Gold long-exposure light trails — diagonal swoops, painted with SVG */
-body::after, gradio-app::after {
-    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 900' preserveAspectRatio='xMidYMid slice'><defs><filter id='glow'><feGaussianBlur stdDeviation='6'/></filter><linearGradient id='g1' x1='0' y1='0' x2='1' y2='0'><stop offset='0' stop-color='%23F5C56B' stop-opacity='0'/><stop offset='0.5' stop-color='%23FFDB8A' stop-opacity='0.85'/><stop offset='1' stop-color='%23F5C56B' stop-opacity='0'/></linearGradient></defs><g filter='url(%23glow)' fill='none' stroke='url(%23g1)' stroke-width='2.5' stroke-linecap='round'><path d='M -50 280 C 250 60, 700 200, 1250 80'/><path d='M -50 460 C 320 220, 760 380, 1250 240' stroke-width='1.8'/><path d='M -50 640 C 220 420, 780 560, 1250 420' stroke-width='1.4'/><path d='M -50 800 C 280 580, 740 760, 1250 600' stroke-width='1.2'/></g></svg>");
-    background-size: cover;
-    opacity: 0.55; mix-blend-mode: screen;
+/* CONTENT sits above the fixed sun layer. */
+.gradio-container {
+    background: transparent !important;
+    position: relative;
+    z-index: 1;
 }
 
-/* film grain — make it feel photographic, not digital */
-body::before, gradio-app::before {
-    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.94' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 0.78 0 0 0 0 0.42 0 0 0 0.5 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
-    opacity: 0.12; mix-blend-mode: overlay;
+/* SUN-OVERLAP READABILITY: any gold/cream text gets a dark halo so it pops against
+   the bright orange/red of the sun, and a subtle stroke for hard edges. Reads as
+   "lit from behind" on dark bg, as "outlined" on bright bg. Plus on the right-half
+   accordion labels (which directly overlap the sun corner), apply mix-blend-mode so
+   the text auto-inverts as it crosses the sun. */
+.gradio-container button.lg,
+.gradio-container button.primary,
+.gradio-container [data-testid="block-info"],
+.gradio-container input[role="listbox"],
+.gradio-container label.svelte-19qdtil span.svelte-19qdtil,
+.gradio-container .label-wrap,
+.gradio-container .label-wrap span,
+.gradio-container summary,
+.gradio-container [class^="label"],
+#token-preview .token,
+.knob-ticks span {
+    text-shadow:
+      0 0 1px rgba(0, 0, 0, 0.95),
+      0 0 4px rgba(0, 0, 0, 0.85),
+      0 0 14px rgba(0, 0, 0, 0.65) !important;
 }
+/* Sun-overlap masking restored: dark semi-opaque pills on labels so the bright sun
+   doesn't bleed through into text. Text stays gold; pill blocks the sun behind. */
+.gradio-container .label-wrap,
+.gradio-container summary,
+.gradio-container [data-testid="block-info"] {
+    background: rgba(14, 8, 32, 0.78) !important;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 214, 107, 0.22) !important;
+    border-radius: 999px !important;
+    padding: 10px 22px !important;
+    margin: 4px 0 !important;
+}
+.gradio-container [data-testid="block-info"] {
+    display: inline-block !important;
+    padding: 3px 12px !important;
+    font-size: 12px !important;
+    margin-bottom: 6px !important;
+}
+
+/* (Light trails + film grain layers removed. Flat dark bg + viewport-fixed sun only.) */
 
 .gradio-container { max-width: 1040px !important; margin: 0 auto !important; padding: 72px 48px 120px !important; position: relative; z-index: 1; }
 
@@ -720,14 +818,42 @@ input:focus, select:focus {
     color: var(--gold-bright) !important;
 }
 
-/* dropdown popup options — dark backing so they read on the violet bg */
-[role="listbox"] [role="option"], .options ul li {
-    background: rgba(14, 8, 32, 0.96) !important;
+/* Dropdown popup panel: dark solid background on the entire popup container plus
+   each option, so neither the wrapper gaps nor the options show the page through. */
+ul[role="listbox"],
+[role="listbox"]:not(input),
+.options,
+.options ul,
+.choices,
+ul.choices,
+.svelte-1xfsv4t .options,
+.svelte-1xfsv4t .options ul {
+    background: rgba(14, 8, 32, 0.98) !important;
+    border: 1px solid var(--gold) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6) !important;
+    padding: 6px 0 !important;
+    z-index: 100 !important;
+}
+ul[role="listbox"] [role="option"],
+[role="option"],
+.options ul li,
+.choices li {
+    background: transparent !important;        /* the parent's dark covers everything */
     color: var(--cream) !important;
     font-family: 'Cormorant Garamond', serif !important;
     font-style: italic !important;
+    font-size: 16px !important;
+    padding: 8px 18px !important;
+    border-radius: 0 !important;
 }
-[role="listbox"] [role="option"]:hover { background: rgba(245, 197, 107, 0.18) !important; color: var(--gold-bright) !important; }
+ul[role="listbox"] [role="option"]:hover,
+[role="option"]:hover,
+.options ul li:hover,
+.choices li:hover {
+    background: rgba(245, 197, 107, 0.18) !important;
+    color: var(--gold-bright) !important;
+}
 
 /* mode radio — luminous gold tabs.
    The radio group's outer wrap on its own variant of the svelte class */
@@ -749,30 +875,56 @@ input:focus, select:focus {
     border: none !important;
     box-shadow: none !important;
 }
-/* The dropdown internal button look — the gradio "selected value pill" */
-.gradio-container .gr-dropdown,
-.gradio-container [data-testid="dropdown"] > div > div {
-    background: transparent !important;
-    border: none !important;
-    border-bottom: 1px solid rgba(245, 197, 107, 0.32) !important;
-    border-radius: 0 !important;
-    padding: 6px 4px !important;
+/* Gradio v6 dropdown internals: the .wrap holds the white default; override the whole
+   stack down to the bare <input role="listbox">. */
+.gradio-container .wrap.svelte-1xfsv4t,
+.gradio-container .wrap-inner.svelte-1xfsv4t,
+.gradio-container .secondary-wrap.svelte-1xfsv4t {
+    background: rgba(14, 8, 32, 0.92) !important;
+    border: 1px solid var(--gold) !important;
+    border-radius: 999px !important;
+    box-shadow: 0 0 18px rgba(255, 214, 107, 0.12) !important;
 }
-[role="radio"] label, .gr-input-label,
-input[type="radio"] + label, label[for*="radio"] {
+.gradio-container input[role="listbox"],
+.gradio-container input.border-none.svelte-1xfsv4t {
     background: transparent !important;
-    color: var(--cream-mute) !important;
+    color: var(--gold-bright) !important;
     font-family: 'Cormorant Garamond', serif !important;
     font-style: italic !important;
-    font-weight: 400 !important;
-    font-size: 15px !important;
-    padding: 8px 28px !important;
-    cursor: pointer !important;
-    border-radius: 999px !important;
-    transition: all 0.22s !important;
-    text-transform: none !important;
-    letter-spacing: 0 !important;
+    font-size: 17px !important;
+    padding: 8px 18px !important;
+    border: none !important;
 }
+.gradio-container input[role="listbox"]::placeholder { color: var(--cream-mute) !important; opacity: 1 !important; }
+.gradio-container .dropdown-arrow.svelte-loyhyk { fill: var(--gold-bright) !important; }
+
+/* Mode radio (Ghost / Tongues) — Gradio v6 svelte-19qdtil */
+.gradio-container label.svelte-19qdtil {
+    background: rgba(14, 8, 32, 0.7) !important;
+    border: 1px solid var(--gold) !important;
+    border-radius: 999px !important;
+    padding: 8px 22px !important;
+    margin: 0 6px 0 0 !important;
+    cursor: pointer !important;
+    transition: all 0.22s !important;
+}
+.gradio-container label.svelte-19qdtil span.svelte-19qdtil {
+    color: var(--gold-bright) !important;
+    font-family: 'Cormorant Garamond', serif !important;
+    font-style: italic !important;
+    font-weight: 500 !important;
+    font-size: 16px !important;
+}
+.gradio-container label.svelte-19qdtil:has(input:checked) {
+    background: linear-gradient(180deg, var(--sun-core), var(--sun-mid)) !important;
+    border-color: var(--sun-core) !important;
+    box-shadow: 0 0 22px var(--sun-halo) !important;
+}
+.gradio-container label.svelte-19qdtil:has(input:checked) span.svelte-19qdtil {
+    color: var(--night-deep) !important;
+}
+/* The native radio dot — hide it; we use the chip-style instead */
+.gradio-container input[type="radio"].svelte-19qdtil { display: none !important; }
 [role="radio"][aria-checked="true"] label,
 input[type="radio"]:checked + label {
     background: linear-gradient(180deg, var(--sun-core), var(--sun-mid)) !important;
@@ -782,19 +934,19 @@ input[type="radio"]:checked + label {
 
 /* buttons — glowing pill on dark, gold borders */
 button.primary, button[variant="primary"], .primary > button, button.lg, .gr-button {
-    background: rgba(14, 8, 32, 0.62) !important;
+    background: rgba(14, 8, 32, 0.92) !important;       /* opaque enough to read over the sun */
     color: var(--gold-bright) !important;
-    border: 1px solid var(--gold) !important;
-    padding: 13px 32px !important;
+    border: 2px solid var(--gold) !important;            /* thicker for visibility */
+    padding: 14px 34px !important;
     font-family: 'Cormorant Garamond', serif !important;
     font-style: italic !important;
-    font-weight: 400 !important;
-    font-size: 17px !important;
+    font-weight: 500 !important;                          /* heavier weight */
+    font-size: 18px !important;
     letter-spacing: 0.02em !important;
     border-radius: 999px !important;
-    box-shadow: 0 0 24px rgba(245, 197, 107, 0.18), inset 0 0 12px rgba(245, 197, 107, 0.08) !important;
+    box-shadow: 0 0 28px rgba(255, 214, 107, 0.32), inset 0 0 14px rgba(255, 214, 107, 0.12) !important;
     transition: all 0.24s !important;
-    text-shadow: 0 0 8px rgba(245, 197, 107, 0.4);
+    text-shadow: 0 0 6px rgba(255, 214, 107, 0.55);
 }
 button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     background: var(--gold-bright) !important;
@@ -816,14 +968,66 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     box-shadow: 0 0 40px var(--sun-halo) !important;
 }
 
-/* audio output card */
-.gr-audio, audio {
-    background: rgba(14, 8, 32, 0.62) !important;
-    border: 1px solid var(--hairline) !important;
-    border-radius: 6px !important;
-    color: var(--cream) !important;
+/* ALL AUDIO WIDGETS (output "the take" + the voice-clone / backing-track upload
+   inputs). Gradio renders these white by default, which clashes with the dark theme
+   and reads as a "broken white player". Force the whole stack dark + gold. */
+.gradio-container [data-testid="audio"],
+#audio-out {
+    background: rgba(14, 8, 32, 0.88) !important;
+    border: 1px solid var(--gold) !important;
+    border-radius: 14px !important;
+    padding: 14px 16px !important;
+    box-shadow: 0 0 20px rgba(255, 214, 107, 0.14) !important;
+    margin: 10px 0 !important;
 }
-audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !important; }
+/* The white "Drop Audio Here / Click to Upload" drop zone inside audio inputs. */
+.gradio-container [data-testid="audio"] .wrap,
+.gradio-container [data-testid="audio"] .upload-container,
+.gradio-container [data-testid="audio"] .file-upload,
+.gradio-container [data-testid="audio"] [class*="upload"],
+.gradio-container [data-testid="audio"] > div {
+    background: transparent !important;
+    color: var(--cream) !important;
+    border-color: var(--hairline) !important;
+}
+/* The white block-label tab (e.g. "the take") that floats top-left. */
+.gradio-container [data-testid="audio"] [data-testid="block-label"],
+.gradio-container [data-testid="block-label"],
+.gradio-container label.svelte-19djge9 {
+    background: rgba(14, 8, 32, 0.92) !important;
+    color: var(--gold) !important;
+    border: 1px solid var(--hairline) !important;
+    border-radius: 8px !important;
+}
+.gradio-container [data-testid="block-label"] svg,
+.gradio-container [data-testid="block-label"] span { color: var(--gold) !important; fill: var(--gold) !important; }
+.gradio-container [data-testid="audio"] audio {
+    width: 100% !important; height: 46px !important; display: block !important;
+}
+/* The native HTML5 audio control bar: tint it to fit the dark theme. */
+.gradio-container [data-testid="audio"] audio::-webkit-media-controls-panel {
+    background: rgba(20, 12, 40, 0.9) !important;
+}
+
+/* LIVE PREVIEW TEXTBOX (#ghost-lyric): big, gold-on-dark, italic — it's the
+   "see what the voice will say" surface and must be prominent. */
+#ghost-lyric, #ghost-lyric > div, #ghost-lyric .wrap, #ghost-lyric > label > div {
+    background: rgba(14, 8, 32, 0.92) !important;
+    border: 1px solid var(--gold) !important;
+    border-radius: 14px !important;
+}
+#ghost-lyric textarea, #ghost-lyric input {
+    background: transparent !important;
+    color: var(--gold-bright) !important;
+    font-family: 'Cormorant Garamond', serif !important;
+    font-style: italic !important;
+    font-size: 22px !important;
+    line-height: 1.4 !important;
+    text-align: center !important;
+    border: none !important;
+    padding: 18px 22px !important;
+    min-height: 80px !important;
+}
 
 /* THE DIAL — brass knob with vermillion arc and a pointer needle.
    Tick numbers sit in a semicircle above the knob: 0 on the left, 4 on the right. */
@@ -834,11 +1038,11 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
 .dial-tag {
     font-family: 'IBM Plex Mono', monospace; font-size: 10px;
     color: var(--gold); letter-spacing: 0.34em; text-transform: uppercase;
-    opacity: 0.8; margin-bottom: 28px;
+    opacity: 0.8; margin-bottom: 12px;        /* gap below the tag; ticks ride above the knob on their own */
 }
 .knob-stage {
     position: relative;
-    width: 360px; height: 280px;
+    width: 420px; height: 400px;          /* big enough to hold ticks at radius 156 above and around the knob */
     display: flex; align-items: flex-end; justify-content: center;
 }
 /* Tick semicircle hugging the brass ring of the knob.
@@ -846,7 +1050,7 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
 .knob-ticks {
     position: absolute;
     left: 50%;
-    bottom: 106px;   /* knob-wrap margin-bottom (16) + knob radius (90) = knob center */
+    bottom: 156px;   /* knob-wrap margin-bottom (16) + knob radius (140) = knob center */
     width: 0; height: 0; pointer-events: none;
 }
 .knob-ticks span {
@@ -855,7 +1059,7 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
     transform: translate(calc(var(--tx) - 50%), calc(var(--ty) - 50%));
     display: flex; flex-direction: column; align-items: center;
     font-family: 'Cormorant Garamond', serif; font-style: italic;
-    font-size: 19px; color: var(--cream-mute);
+    font-size: 24px; color: var(--cream-mute);
     cursor: pointer; pointer-events: auto;
     transition: color 0.22s, transform 0.22s;
     line-height: 1;
@@ -877,14 +1081,14 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
    Inspired by 1970s hi-fi tuner knobs (Marantz, Moog, Bakelite). */
 .knob-wrap {
     position: relative;
-    width: 180px; height: 180px;
+    width: 280px; height: 280px;
     display: flex; align-items: center; justify-content: center;
     margin-bottom: 16px;
-    filter: drop-shadow(0 10px 20px rgba(0,0,0,0.55));
+    filter: drop-shadow(0 14px 28px rgba(0,0,0,0.65));
 }
 .knob {
     position: relative; z-index: 2;
-    width: 180px; height: 180px; border-radius: 50%;
+    width: 280px; height: 280px; border-radius: 50%;
     cursor: grab; outline: none;
     /* The flat face: warm walnut / dark Bakelite */
     background:
@@ -909,8 +1113,8 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
       #4A3618 2deg 4deg,
       #8B6E3A 4deg 6deg
     );
-    -webkit-mask: radial-gradient(circle, transparent 64px, #000 65px, #000 88px, transparent 89px);
-            mask: radial-gradient(circle, transparent 64px, #000 65px, #000 88px, transparent 89px);
+    -webkit-mask: radial-gradient(circle, transparent 102px, #000 103px, #000 136px, transparent 137px);
+            mask: radial-gradient(circle, transparent 102px, #000 103px, #000 136px, transparent 137px);
     filter: brightness(0.92);
 }
 /* Subtle inner highlight ring between knurled rim and flat face */
@@ -924,33 +1128,35 @@ audio::-webkit-media-controls-panel { background: rgba(14, 8, 32, 0.85) !importa
     filter: brightness(1.04);
 }
 .knob.dragging { cursor: grabbing; }
-/* Faint gold arc around the rim showing dial position */
+/* Faint gold arc OUTSIDE the knurled rim showing dial position.
+   Knob radius 140, rim outer ~136, so the arc sits at radius 144..150. The element
+   extends to inset:-16px so the mask circle fits. */
 .knob-arc {
-    position: absolute; z-index: 1; inset: -8px; border-radius: 50%; pointer-events: none;
+    position: absolute; z-index: 1; inset: -16px; border-radius: 50%; pointer-events: none;
     background: conic-gradient(from 270deg,
       var(--gold) 0deg,
       var(--gold-bright) var(--arc-deg, 0deg),
       transparent var(--arc-deg, 0deg) 180deg,
       transparent 360deg);
-    -webkit-mask: radial-gradient(circle, transparent 96px, #000 97px, #000 102px, transparent 103px);
-            mask: radial-gradient(circle, transparent 96px, #000 97px, #000 102px, transparent 103px);
-    filter: drop-shadow(0 0 6px var(--gold-glow));
-    opacity: 0.85;
+    -webkit-mask: radial-gradient(circle, transparent 144px, #000 145px, #000 152px, transparent 153px);
+            mask: radial-gradient(circle, transparent 144px, #000 145px, #000 152px, transparent 153px);
+    filter: drop-shadow(0 0 8px var(--gold-glow));
+    opacity: 0.9;
 }
 /* THE INDICATOR LINE — a thin cream line painted on the knob face, from center
    to the edge of the knurled rim. Rotates with the knob value. */
 .knob-pointer {
     position: absolute; z-index: 4;
-    left: 50%; top: 14px;
-    width: 4px; height: 60px;
-    margin-left: -2px;
+    left: 50%; top: 18px;
+    width: 5px; height: 96px;
+    margin-left: -2.5px;
     background: linear-gradient(180deg, #FFF6D8 0%, #EFDBA8 80%, rgba(239, 219, 168, 0.0) 100%);
     border-radius: 2px;
     box-shadow:
-      0 0 6px rgba(255, 240, 200, 0.6),
-      0 0 14px rgba(255, 240, 200, 0.3),
+      0 0 8px rgba(255, 240, 200, 0.7),
+      0 0 18px rgba(255, 240, 200, 0.35),
       inset 0 1px 0 rgba(255, 255, 240, 0.85);
-    transform-origin: 50% 76px;  /* pivot at the knob center (90 - 14) */
+    transform-origin: 50% 122px;  /* pivot at the knob center (140 - 18) */
     transform: rotate(var(--knob-angle, -90deg));
     pointer-events: none;
     transition: transform 0.24s cubic-bezier(.34,1.36,.4,1);
@@ -1291,7 +1497,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                         label="the path", scale=1)
 
     # custom voice — record or upload a 10-sec clip; F5-TTS clones it
-    with gr.Accordion("Or clone your own voice (record / upload, 6-12 sec)",
+    with gr.Accordion("🎤  Clone your own voice  (record or upload 6-12 sec)",
                       open=False, elem_id="custom-voice-accord"):
         with gr.Row():
             custom_voice = gr.Audio(
@@ -1308,7 +1514,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
             )
 
     # background music — upload an instrumental; we tempo-lock + mix the vocal over it
-    with gr.Accordion("Or drop in a backing track to mix the dial over",
+    with gr.Accordion("🎵  Add background music  (mix a backing track under the voice)",
                       open=False, elem_id="music-accord"):
         with gr.Row():
             music_input = gr.Audio(
@@ -1327,7 +1533,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     # Token preview HTML is Python-rendered on every lyric / state change so the markup
     # is always in sync. JS only handles the click-to-edit popover and writes the new
     # state back into the textbox below; Python then re-renders on that change.
-    with gr.Accordion("Hand-tune individual words (click any word to edit)",
+    with gr.Accordion("✎  Stretch or re-spell individual words  (click any word to edit)",
                       open=False, elem_id="overrides-accord"):
         token_preview = gr.HTML(_render_token_preview(DEFAULT_TEXT, ""),
                                  elem_id="token-preview")
@@ -1371,26 +1577,51 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     level = gr.Slider(0, 4, value=0, step=1, label="", elem_id="dial-slider",
                       show_label=False, visible=True)
 
-    # post-fx + seed as a quiet adjuster row
-    with gr.Row():
-        postfx = gr.Dropdown(list(POSTFX_PRESETS.keys()), value="subtle",
-                             label="post · reverb / chorus / octave", scale=2)
-        seed = gr.Number(value=42, precision=0, label="seed", scale=1)
-
-    # two actions, side by side, the morph one in vermillion
-    with gr.Row(elem_classes="action-row"):
-        speak_btn = gr.Button("speak once", variant="primary",
-                              elem_classes="primary", scale=1)
-        morph_btn = gr.Button("morph 0 → 4 in one breath", variant="primary",
-                              elem_classes="primary", scale=1)
-
-    audio_out = gr.Audio(label="the take", type="filepath", autoplay=False)
-    ghost_lyric = gr.Textbox(label="the ghost (the deterministic substitution at this dial)",
+    # Live preview of what the audio will say, updates as the dial / mode / lyric change.
+    ghost_lyric = gr.Textbox(label="what the voice will say at this dial position",
                               interactive=False, lines=2,
-                              elem_classes="ghost-lyric")
-    metrics = gr.HTML(readout())
+                              value="",
+                              elem_classes="ghost-lyric",
+                              elem_id="ghost-lyric")
+
+    # post-fx as a quiet adjuster: how much room / reverb to wrap the voice in.
+    postfx = gr.Dropdown(list(POSTFX_PRESETS.keys()), value="subtle",
+                         label="space (dry = bare voice, cathedral = drenched in reverb)")
+    # seed is wired but hidden from the UI (it powers determinism but most users don't care).
+    seed = gr.Number(value=42, precision=0, label="seed", visible=False)
+
+    # two actions: hear ONE dial position, or hear the WHOLE 0->4 dissolution in one take.
+    # morph works in whichever mode is selected (Tongues or Ghost), so the label is neutral.
+    with gr.Row(elem_classes="action-row"):
+        speak_btn = gr.Button("play this dial", variant="primary",
+                              elem_classes="primary", scale=1)
+        morph_btn = gr.Button("dissolve · sweep 0 → 4", variant="primary",
+                              elem_classes="primary", scale=1)
+
+    audio_out = gr.Audio(label="the take", type="filepath", autoplay=True,
+                          elem_id="audio-out")
+    # Holds the last DRY (pre-effect) voice so changing post-fx / music re-renders
+    # instantly from it instead of re-running F5-TTS.
+    dry_cache = gr.State(None)
+    # Hidden — stub metrics block, only shown after we wire real Whisper-WER + Resemblyzer.
+    metrics = gr.HTML(readout(), visible=False)
 
     # Bind the brass knob to the hidden slider. Gradio strips inline <script> tags,
+    # Inject the fixed background sun layer as a real <div> on <body>. A real node
+    # (not a ::before pseudo) is immune to Gradio re-rendering its subtree and never
+    # fights another element's pseudo slot. Idempotent so a reconnect can't duplicate it.
+    demo.load(
+        fn=None,
+        js="""() => {
+            if (!document.getElementById('bg-sun')) {
+                const d = document.createElement('div');
+                d.id = 'bg-sun';
+                document.body.prepend(d);
+            }
+            return [];
+        }""",
+    )
+
     # so we inject this via demo.load(js=...) which runs once on page mount.
     demo.load(
         fn=None,
@@ -1408,7 +1639,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                 // .knob-ticks is positioned at the knob center, so polar coords directly:
                 // tx = sin(angle)*R, ty = -cos(angle)*R. Knurled rim outer is at 88px, so
                 // a radius of 102 sits the tick just outside the rim.
-                const radius = 102;
+                const radius = 178;
                 ticks.forEach(t => {
                     const lv = Number(t.dataset.lv);
                     const angle = levelToAngle(lv);
@@ -1584,20 +1815,63 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                     inputs=[sentence, overrides_text], outputs=token_preview)
     overrides_text.change(_render_token_preview,
                           inputs=[sentence, overrides_text], outputs=token_preview)
+
+    # Live preview of "what the audio will say" as the dial / mode / lyric changes.
+    # Ghost mode: mondegreen-substituted real English words.
+    # Tongues mode: phoneme-corrupted pseudo-text.
+    def _live_preview(text, lv, m, sd):
+        try:
+            lv = _safe_int(lv)
+            sd = _safe_int(sd) or 42
+            if not text or not text.strip():
+                return ""
+            # Dial=0 always returns the original lyric in either mode.
+            if lv <= 0:
+                return text.strip()
+            if m == MODE_GHOST:
+                # Ghost: real English words substituted via mondegreen + DistilGPT-2 rerank.
+                return ENGINE.ghost_text(text, lv, seed=sd)
+            else:
+                # Tongues: pseudo-ASCII rendering of the phoneme corruption that the TTS
+                # actually reads. Trimmed of inter-phoneme hyphens for readability.
+                from scripts.corrupt_phonemes import load_lm, corrupt_sentence
+                from pathlib import Path
+                _lm = getattr(_live_preview, "_lm", None)
+                if _lm is None:
+                    _lm = load_lm(Path("data/phoneme_lm.npz"))
+                    _live_preview._lm = _lm
+                _, _, pseudo, _ = corrupt_sentence(text, lv, _lm, seed=sd)
+                return pseudo
+        except Exception as e:
+            return f"(preview unavailable: {e})"
+
+    for trig in (level, sentence, mode, seed):
+        trig.change(_live_preview,
+                    inputs=[sentence, level, mode, seed],
+                    outputs=ghost_lyric)
+    # Also compute the preview once on initial page load so the textbox isn't empty.
+    demo.load(_live_preview,
+              inputs=[sentence, level, mode, seed],
+              outputs=ghost_lyric)
     speak_btn.click(
         speak,
         inputs=[sentence, voice, level, postfx, mode, seed,
                 custom_voice, custom_voice_text,
                 music_input, music_gain, overrides_text],
-        outputs=[audio_out, metrics, ghost_lyric],
+        outputs=[audio_out, metrics, ghost_lyric, dry_cache],
     )
     morph_btn.click(
         morph,
         inputs=[sentence, voice, postfx, mode, seed,
                 custom_voice, custom_voice_text,
                 music_input, music_gain, overrides_text],
-        outputs=[audio_out, metrics, ghost_lyric],
+        outputs=[audio_out, metrics, ghost_lyric, dry_cache],
     )
+    # Live: changing post-fx / music re-renders from the cached dry voice (no re-inference).
+    for trig in (postfx, music_input, music_gain):
+        trig.change(reapply_fx,
+                    inputs=[dry_cache, postfx, music_input, music_gain],
+                    outputs=audio_out)
 
     gr.HTML(
         """
