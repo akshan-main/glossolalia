@@ -62,7 +62,7 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     try:
-        import patches  # noqa: F401 — installs F5TTS.load_lora (DECISIONS.md "F5-TTS LoRA path = DIY PEFT")
+        import patches  # noqa: F401, installs F5TTS.load_lora (DECISIONS.md "F5-TTS LoRA path = DIY PEFT")
     except ImportError as e:
         print(f"could not import patches/ from {Path(__file__).resolve().parent.parent}: {e}", file=sys.stderr); sys.exit(1)
     try:

@@ -6,7 +6,7 @@ every phoneme drawn from a Boltzmann distribution over the 39 ARPAbet phonemes:
     q(y | x, level) ∝ exp( -D_panphon(x, y) / T(level) ) * bias_weight(y)
 
 where D_panphon is the precomputed feature-edit-distance matrix from data/phoneme_lm.npz
-(PanPhon library, Mortensen et al. COLING 2016 — values verified empirically: P/B=1, S/SH=2,
+(PanPhon library, Mortensen et al. COLING 2016, values verified empirically: P/B=1, S/SH=2,
 P/M=3, P/ZH=7, K/N=8, AA/P=11). T(level) is a temperature schedule:
 
     T(level) = 0.5 * exp(2.5 * p_level)
@@ -14,7 +14,7 @@ P/M=3, P/ZH=7, K/N=8, AA/P=11). T(level) is a temperature schedule:
     -> T(2)=1.75 (distance-3 neighbors come into play)
     -> T(4)=6.09 (full range opens; bias_weight steers the attractor)
 
-The temperature schedule is a design choice — exponential ramp so early dial departures
+The temperature schedule is a design choice, exponential ramp so early dial departures
 move only to near-identical phonemes (P->B, S->SH) and the dial only fully opens at the top.
 No published precedent for this exact schedule; chosen by feel.
 
@@ -28,10 +28,10 @@ single consonant. This is grounded in the documented 95.7% CV-structure preferen
 real glossolalia (Link & Tomaschek 2024 PMC10916350; Samarin 1973 Language and Speech).
 
 Outputs four views of the corrupted phonemes:
-  - ARPAbet  (with stress digits)            — for training labels
-  - IPA      (no stress)                     — for F5-TTS phoneme input (if model accepts it)
-  - pseudo   (lowercase English orthography) — the in-distribution TTS input we feed F5-TTS
-  - display  (UPPER-stressed, hyphen-syllab) — for the Gradio UI readout
+  - ARPAbet  (with stress digits)           , for training labels
+  - IPA      (no stress)                    , for F5-TTS phoneme input (if model accepts it)
+  - pseudo   (lowercase English orthography), the in-distribution TTS input we feed F5-TTS
+  - display  (UPPER-stressed, hyphen-syllab), for the Gradio UI readout
 
 p_level: { 0: 0.0, 1: 0.25, 2: 0.50, 3: 0.75, 4: 1.0 }
 """
@@ -177,7 +177,7 @@ def _simplify_clusters(tokens):
 
     A CC onset run is two consecutive ARPAbet consonants between a word break and a vowel.
     We drop the second consonant. CV preference is documented in real glossolalia
-    (Link & Tomaschek 2024 PMC10916350 — 95.7% CV; Samarin 1973 — open-syllable preference).
+    (Link & Tomaschek 2024 PMC10916350, 95.7% CV; Samarin 1973, open-syllable preference).
     """
     out = []
     i = 0
@@ -186,7 +186,7 @@ def _simplify_clusters(tokens):
         tok = tokens[i]
         base = tok.rstrip("012")
         # Detect: previous emitted is a non-phoneme (word break) AND current+next are both
-        # consonants AND the one AFTER next is a vowel — collapse to single onset.
+        # consonants AND the one AFTER next is a vowel, collapse to single onset.
         prev_is_break = (len(out) == 0) or (not out[-1].rstrip("012").isalpha()) or \
                         (out[-1].rstrip("012") not in (set(VOWELS) | _CONSONANTS))
         if prev_is_break and base in _CONSONANTS and i + 1 < n:
@@ -194,7 +194,7 @@ def _simplify_clusters(tokens):
             if nxt in _CONSONANTS and i + 2 < n:
                 nxt2 = tokens[i + 2].rstrip("012")
                 if nxt2 in VOWELS:
-                    # Drop tokens[i+1] — keep the first onset only.
+                    # Drop tokens[i+1], keep the first onset only.
                     out.append(tok)
                     out.append(tokens[i + 2])
                     i += 3
@@ -218,7 +218,7 @@ def to_ipa(tokens):
 
 def to_spelling(tokens):
     """Lowercase pseudo-English orthography. THE input we feed to F5-TTS at training and
-    inference time — empirically in-distribution per F5-TTS issue #362 (owner SWivid confirms
+    inference time, empirically in-distribution per F5-TTS issue #362 (owner SWivid confirms
     'current base models are using characters rather than phonemes')."""
     parts = []
     for tok in tokens:
@@ -236,7 +236,7 @@ def to_display(tokens):
 
     Example: 'i KWIK-lee kuh-LEK-tuhd' for tokens with stress on KWIK and LEK.
 
-    ASCII-only — Merriam-Webster diacritics break F5-TTS's character tokenizer, so we keep
+    ASCII-only, Merriam-Webster diacritics break F5-TTS's character tokenizer, so we keep
     this format compatible with the TTS input pipeline (the `pseudo` string remains the
     actual TTS input; `display` is for the Gradio readout only).
     """

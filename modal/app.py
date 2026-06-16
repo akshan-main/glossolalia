@@ -2,12 +2,11 @@
 
 Replaces Colab kernel-reset thrash with a clean reproducible runner. Same architecture
 the workflow synthesized + verified, with the dtype handling fixed (no PEFT
-modules_to_save quirks — level_embed attached directly to DiT, optimized as a separate
+modules_to_save quirks, level_embed attached directly to DiT, optimized as a separate
 param group).
 
 Run:
     modal run modal/app.py                  # full pipeline (~50 min, ~$2.50)
-    modal run modal/app.py::dry_run         # 30s sanity check (~$0.05) — DO THIS FIRST
     modal run modal/app.py::sweep_and_verify  # re-sweep with existing adapter
 
 Architecture: see DECISIONS.md "v5 AdaLN-side level conditioning".
@@ -45,7 +44,7 @@ image = (
         "cached_path",
     )
     .run_commands(
-        # Pre-download NLTK assets — caches into image
+        # Pre-download NLTK assets, caches into image
         "python -c \"import nltk; "
         "nltk.download('averaged_perceptron_tagger_eng', quiet=True); "
         "nltk.download('averaged_perceptron_tagger', quiet=True); "
@@ -150,20 +149,6 @@ def _setup_repo():
         subprocess.check_call(["git", "-C", REPO_DIR, "pull", "-q", "origin", "main"])
     import sys
     sys.path.insert(0, REPO_DIR)
-
-
-@app.function(gpu="A100-40GB", timeout=60 * 2)
-def dry_run():
-    """30-second sanity check: GPU works, F5-TTS imports, repo clones. Costs ~$0.05."""
-    import torch
-    _setup_repo()
-    print(f"  torch: {torch.__version__} | cuda: {torch.cuda.is_available()}")
-    print(f"  device: {torch.cuda.get_device_name(0)}")
-    from f5_tts.api import F5TTS
-    from peft import LoraConfig
-    import patches  # repo's patches/__init__.py
-    print("  f5_tts + peft + patches all import OK")
-    print("  dry_run PASS")
 
 
 def _stage_inputs():
@@ -437,7 +422,7 @@ def train_v5():
 
     dit.forward = types.MethodType(_patched_forward, dit)
 
-    # v7 LoRA config: revert v6's capacity strip (0/9 audible vs v5's 4/9) — empirically
+    # v7 LoRA config: revert v6's capacity strip (0/9 audible vs v5's 4/9), empirically
     # the attn_norm.linear surface was load-bearing on supervised-regression scalar
     # control, contrary to Sliders' contrastive-pair recipe. Keep v5's r=16 alpha=16 +
     # attn_norm.linear targets, with v6's 40-epoch / 2e-4 LR_LORA / 2e-3 LEVEL_LR.
@@ -573,7 +558,7 @@ def train_v5():
                 per_level_loss[lvl].append(float(loss.item()))
             base_dit._current_scalars = None
             clear_text_cache(base_dit)
-            # Print at steps 1, 5, then every 25 — log per-level loss + grad ratio
+            # Print at steps 1, 5, then every 25, log per-level loss + grad ratio
             if step in (1, 5) or step % 25 == 0:
                 with torch.no_grad():
                     probe = torch.tensor([[0.0], [0.25], [0.5], [0.75], [1.0]],
@@ -686,7 +671,7 @@ def sweep_and_verify():
 )
 def pull_and_generate_ghost():
     """v9: regenerate corpus with --input-mode=mondegreen for Ghost mode LoRA training.
-    Saves to /vol/coherence_ghost and /vol/coherence_ghost_ds — does not overwrite v8 corpus."""
+    Saves to /vol/coherence_ghost and /vol/coherence_ghost_ds, does not overwrite v8 corpus."""
     import os, shutil, subprocess
     _setup_repo()
 

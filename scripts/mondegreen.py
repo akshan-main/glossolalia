@@ -1,4 +1,4 @@
-"""Mondegreen substitution for the Glossolalia Dial — "Ghost mode".
+"""Mondegreen substitution for the Glossolalia Dial, "Ghost mode".
 
 Given an input lyric + a dial level, returns a sequence of REAL English words whose phoneme
 sequence is phonetically close to the source. The output is meant to be sung in place of
@@ -27,7 +27,7 @@ Coverage constraints:
 What this is NOT:
   - A generative model. No LLM, no neural net. Just a phoneme-distance search over CMUdict.
   - A guarantee that the output is grammatical or semantically sensible. The output may read
-    as a nonsense sentence of real English words. That's the point — the listener's brain
+    as a nonsense sentence of real English words. That's the point, the listener's brain
     fills in meaning via pareidolia.
 
 Sources used (verified):
@@ -40,7 +40,7 @@ Design choices (no published precedent claimed):
     lyric-substitution constraint in parody/pastiche traditions (no specific citation).
   - Stress-position match is enforced (same primary-stress syllable index in source and
     candidate). Music-cognition literature (Kolinsky et al., Empirical Musicology Review)
-    surfaced by workflow synthesis — not personally re-verified for this docstring.
+    surfaced by workflow synthesis, not personally re-verified for this docstring.
   - Function-word handling: HELD CONSTANT at all dial levels (small closed-class set in
     _FUNCTION_WORDS). Substituting them adds noise where listeners process with delayed
     commitment; we skip them so the ghost lands on the content-word stress points.
@@ -117,7 +117,7 @@ _ARPABET_TO_IPA = {
 # Word-token splitter that preserves whitespace and punctuation.
 _TOKEN_RE = re.compile(r"([A-Za-z']+|[^A-Za-z']+)")
 
-# Function words held constant — they're typically unstressed and listeners skip over them
+# Function words held constant, they're typically unstressed and listeners skip over them
 # perceptually; substituting them adds noise without much added ghost effect. The list is
 # the standard short closed-class items in English (articles, prepositions, conjunctions,
 # auxiliaries, common pronouns). Hand-curated; no published precedent claimed.
@@ -147,7 +147,7 @@ def _primary_stress_syllable(phones_with_stress: tuple[str, ...]) -> int:
     (stress on syllable 0) with an iambic candidate (stress on syllable 1) makes the
     ghost rhythmically wrong and breaks perception under the original melody.
     Citation provenance: Kolinsky et al. (emusicology.org/article/view/3729) + EEG
-    study PMC3225926 — stress mismatch degrades word recognition in song contexts.
+    study PMC3225926, stress mismatch degrades word recognition in song contexts.
     """
     syl_idx = -1
     for p in phones_with_stress:
@@ -230,7 +230,7 @@ class MondegreenIndex:
         src_ipa = self._word_to_ipa[word]
         src_syl = self._word_to_syl[word]
         src_stress = self._word_to_stress_pos[word]
-        # Candidates are bucketed by (syllable count, primary stress position) — both
+        # Candidates are bucketed by (syllable count, primary stress position), both
         # must match. Stress-mismatched substitutes break the perceptual ghost under
         # the original melody (Kolinsky et al.; EEG study PMC3225926).
         bucket = self._syl_stress_bucket.get((src_syl, src_stress), [])
@@ -291,7 +291,7 @@ class MondegreenIndex:
         broken by candidate distance then alphabetical.
 
         Without a reranker, falls back to the per-word weighted draw (no semantic
-        coherence — substitutions are independent across positions).
+        coherence, substitutions are independent across positions).
         """
         if reranker is None or level == 0:
             return self._substitute_independent(sentence, level, seed)
@@ -381,7 +381,7 @@ class MondegreenIndex:
         for pos, cands in enumerate(per_position):
             src_tok = tokens[pos]
             if cands is None:
-                # Pass-through — append the same source token to every beam.
+                # Pass-through, append the same source token to every beam.
                 beams = [(beam + [src_tok], score) for beam, score in beams]
                 continue
             expanded: list[tuple[list[str], float]] = []
@@ -433,7 +433,7 @@ class LMReranker:
     beam search over phonetic-ghost candidates.
 
     Default model is DistilGPT-2 (~82M params, ~330MB on disk). Loads lazily on first
-    score() call. CPU-only is fine for ~10-word lyrics at beam_width=8 — scores ~80
+    score() call. CPU-only is fine for ~10-word lyrics at beam_width=8, scores ~80
     short prompts per sentence, finishes in ~1-2 seconds on a modern Mac.
 
     Determinism: scoring is a pure function of (model weights, input text). No sampling.
@@ -452,7 +452,7 @@ class LMReranker:
     def score_next_token(self, text: str) -> float:
         """Return the log-probability density of `text` under the LM.
 
-        Implemented as average per-token log-likelihood — length-normalized so longer
+        Implemented as average per-token log-likelihood, length-normalized so longer
         partial sequences aren't unfairly penalized. Higher is better.
         """
         torch = self._torch

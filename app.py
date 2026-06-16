@@ -1,4 +1,4 @@
-"""Glossolalia Dial — a single dial that grades a typed lyric into dreamy territory in two
+"""Glossolalia Dial, a single dial that grades a typed lyric into dreamy territory in two
 distinct phonotactic paths:
 
   Ghost mode: lyric is rewritten as a sequence of real English words (mondegreen substitution).
@@ -6,11 +6,12 @@ distinct phonotactic paths:
               distance; reranked by DistilGPT-2 for semantic coherence. F5-TTS base reads it.
   Tongues mode: clean lyric goes into F5-TTS + a fine-tuned LoRA + a learned scalar conditioner
                 (LevelEmbed at AdaLN side). The LoRA produces graded glossolalic audio in the
-                user's chosen voice — invented pseudowords, sonorant-leaning palette.
+                user's chosen voice, invented pseudowords, sonorant-leaning palette.
 
 Both modes ride F5-TTS for voice cloning + audio synthesis. Off-the-Grid: no cloud APIs.
 
-v1 Gradio app (gr.Blocks). v2 (Off-Brand badge) is in app_server.py.
+Gradio app (gr.Blocks) with a hand-built circular knob injected as custom HTML/CSS/JS
+(the Off-Brand dial), driving F5-TTS + the trained LoRA.
 """
 
 from __future__ import annotations
@@ -228,7 +229,7 @@ class TTSEngine:
     inference call. For Ghost mode we set_dial(0) (LevelEmbed contributes ~zero) and feed
     mondegreen-substituted text. For Tongues mode we set_dial(level) and feed the clean
     lyric. The base LoRA attention adaptation is always on, but at dial=0 it produces audio
-    indistinguishable from F5-TTS base (verified empirically by v5 sweep — lv0 sounded
+    indistinguishable from F5-TTS base (verified empirically by v5 sweep, lv0 sounded
     identical to base output)."""
 
     def __init__(self):
@@ -267,7 +268,7 @@ class TTSEngine:
         if self._tts is not None:
             return
         try:
-            import patches  # noqa: F401 — installs F5TTS.load_lora before instantiation
+            import patches  # noqa: F401, installs F5TTS.load_lora before instantiation
             from f5_tts.api import F5TTS
             # Lazy-loaded inside generate(), which on ZeroGPU runs under @spaces.GPU, so
             # F5-TTS's auto device detection picks the allocated GPU. (On the T4 Space it
@@ -281,7 +282,7 @@ class TTSEngine:
                     self._lora_loaded = True
                     print(f"[engine] LoRA loaded from {LORA_PATH}")
                 except Exception as e:
-                    print(f"[engine] LoRA load FAILED ({e}); falling back to base model — Well-Tuned badge forfeit")
+                    print(f"[engine] LoRA load FAILED ({e}); falling back to base model, Well-Tuned badge forfeit")
             else:
                 print("[engine] no LoRA path configured; running base model only")
         except ImportError:
@@ -564,7 +565,7 @@ def reapply_fx(dry_path, postfx_preset, music_path, music_gain_db):
 # ----- CSS (dreamy pastel theme: half-remembered photograph of dusk) -----
 
 CUSTOM_CSS = """
-/* HEAVEN OR LAS VEGAS — direct reference. Long-exposure Christmas lights, deep midnight
+/* HEAVEN OR LAS VEGAS, direct reference. Long-exposure Christmas lights, deep midnight
    violet background, hot red-orange sun in the lower-right hemisphere, gold light trails
    swooping diagonally. Title in hand-drawn flowing italic script (Pinyon Script ≈ the
    Vaughan Oliver "Heaven or Las Vegas" lettering). Photographic, luminous, analog. */
@@ -754,7 +755,7 @@ label, .gr-form > label, span[data-testid="block-info"], .label-wrap, label > sp
     align-items: end !important;
 }
 
-/* lyric textarea — handwriting on light, no card, just a hot gold underline */
+/* lyric textarea, handwriting on light, no card, just a hot gold underline */
 textarea {
     background: transparent !important;
     border: none !important;
@@ -774,9 +775,9 @@ textarea {
 textarea::placeholder { color: var(--cream-mute) !important; opacity: 0.45 !important; font-style: italic !important; }
 textarea:focus { border-bottom-color: var(--gold-bright) !important; outline: none !important; box-shadow: none !important; }
 
-/* dropdowns + number inputs — minimal, gold underline only.
+/* dropdowns + number inputs, minimal, gold underline only.
    Need to nuke svelte's wrapper containers AND the inner input.
-   DO NOT collapse min-height on the slider's .wrap — it would hide the track. */
+   DO NOT collapse min-height on the slider's .wrap, it would hide the track. */
 input, select, .gr-input, .gr-dropdown, [role="listbox"],
 .secondary-wrap, .container,
 [data-testid="dropdown"], [data-testid="number"] > div {
@@ -855,7 +856,7 @@ ul[role="listbox"] [role="option"]:hover,
     color: var(--gold-bright) !important;
 }
 
-/* mode radio — luminous gold tabs.
+/* mode radio, luminous gold tabs.
    The radio group's outer wrap on its own variant of the svelte class */
 .wrap.svelte-1mwvhlq, [role="radiogroup"] {
     display: inline-flex !important; gap: 0 !important;
@@ -898,7 +899,7 @@ ul[role="listbox"] [role="option"]:hover,
 .gradio-container input[role="listbox"]::placeholder { color: var(--cream-mute) !important; opacity: 1 !important; }
 .gradio-container .dropdown-arrow.svelte-loyhyk { fill: var(--gold-bright) !important; }
 
-/* Mode radio (Ghost / Tongues) — Gradio v6 svelte-19qdtil */
+/* Mode radio (Ghost / Tongues), Gradio v6 svelte-19qdtil */
 .gradio-container label.svelte-19qdtil {
     background: rgba(14, 8, 32, 0.7) !important;
     border: 1px solid var(--gold) !important;
@@ -923,7 +924,7 @@ ul[role="listbox"] [role="option"]:hover,
 .gradio-container label.svelte-19qdtil:has(input:checked) span.svelte-19qdtil {
     color: var(--night-deep) !important;
 }
-/* The native radio dot — hide it; we use the chip-style instead */
+/* The native radio dot, hide it; we use the chip-style instead */
 .gradio-container input[type="radio"].svelte-19qdtil { display: none !important; }
 [role="radio"][aria-checked="true"] label,
 input[type="radio"]:checked + label {
@@ -932,7 +933,7 @@ input[type="radio"]:checked + label {
     box-shadow: 0 0 22px var(--sun-halo), inset 0 1px 0 rgba(255, 220, 180, 0.5) !important;
 }
 
-/* buttons — glowing pill on dark, gold borders */
+/* buttons, glowing pill on dark, gold borders */
 button.primary, button[variant="primary"], .primary > button, button.lg, .gr-button {
     background: rgba(14, 8, 32, 0.92) !important;       /* opaque enough to read over the sun */
     color: var(--gold-bright) !important;
@@ -954,7 +955,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     text-shadow: none;
     box-shadow: 0 0 36px var(--gold-glow), inset 0 0 18px rgba(255, 219, 138, 0.4) !important;
 }
-/* second action — Morph — in the hot vermillion / red-orange sun palette */
+/* second action, Morph, in the hot vermillion / red-orange sun palette */
 .action-row button:nth-of-type(2) {
     border-color: var(--sun-mid) !important;
     color: var(--sun-mid) !important;
@@ -1009,7 +1010,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     background: rgba(20, 12, 40, 0.9) !important;
 }
 
-/* LIVE PREVIEW TEXTBOX (#ghost-lyric): big, gold-on-dark, italic — it's the
+/* LIVE PREVIEW TEXTBOX (#ghost-lyric): big, gold-on-dark, italic, it's the
    "see what the voice will say" surface and must be prominent. */
 #ghost-lyric, #ghost-lyric > div, #ghost-lyric .wrap, #ghost-lyric > label > div {
     background: rgba(14, 8, 32, 0.92) !important;
@@ -1029,7 +1030,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     min-height: 80px !important;
 }
 
-/* THE DIAL — brass knob with vermillion arc and a pointer needle.
+/* THE DIAL, brass knob with vermillion arc and a pointer needle.
    Tick numbers sit in a semicircle above the knob: 0 on the left, 4 on the right. */
 #dial-stack {
     display: flex; flex-direction: column; align-items: center;
@@ -1104,7 +1105,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     touch-action: none; user-select: none;
     transition: filter 0.22s;
 }
-/* Knurled rim — fine repeating ridges in brass */
+/* Knurled rim, fine repeating ridges in brass */
 .knob::before {
     content: ''; position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
     background: repeating-conic-gradient(
@@ -1143,7 +1144,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
     filter: drop-shadow(0 0 8px var(--gold-glow));
     opacity: 0.9;
 }
-/* THE INDICATOR LINE — a thin cream line painted on the knob face, from center
+/* THE INDICATOR LINE, a thin cream line painted on the knob face, from center
    to the edge of the knurled rim. Rotates with the knob value. */
 .knob-pointer {
     position: absolute; z-index: 4;
@@ -1163,11 +1164,11 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
 }
 .knob-pin { display: none; }
 
-/* Hide the actual gradio slider — the knob drives it via JS */
+/* Hide the actual gradio slider, the knob drives it via JS */
 #dial-slider { display: none !important; }
 #dial-slider .head, #dial-slider .slider_input_container { display: none !important; }
 
-/* readout — newspaper-strip-like, gold rule */
+/* readout, newspaper-strip-like, gold rule */
 .readout { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-top: 24px;
            border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); padding: 16px 0; }
 .readout-cell { background: transparent; padding: 4px 14px; text-align: left; border-right: 1px solid var(--hairline); }
@@ -1175,7 +1176,7 @@ button.primary:hover, button[variant="primary"]:hover, .gr-button:hover {
 .readout-label { font-family: 'IBM Plex Mono', monospace; font-size: 9px; letter-spacing: 0.32em; color: var(--gold); margin-bottom: 6px; text-transform: uppercase; opacity: 0.7; }
 .readout-val { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 22px; font-weight: 400; color: var(--cream); letter-spacing: -0.01em; }
 
-/* ghost lyric — luminous pulled-quote in gold */
+/* ghost lyric, luminous pulled-quote in gold */
 .ghost-lyric textarea, [data-testid="textbox"]:not(:first-of-type) textarea {
     font-family: 'Cormorant Garamond', serif !important;
     font-style: italic !important;
@@ -1341,7 +1342,7 @@ KNOB_HTML = """
             mask: radial-gradient(circle, transparent 116px, #000 117px, #000 124px, transparent 125px);
     filter: drop-shadow(0 0 8px var(--vermillion-glow));
   }
-  /* indicator — a tiny vermillion bar with subtle glow */
+  /* indicator, a tiny vermillion bar with subtle glow */
   .knob-indicator {
     position: absolute; z-index: 4; left: 50%; top: 22px;
     width: 4px; height: 28px; margin-left: -2px;
@@ -1352,7 +1353,7 @@ KNOB_HTML = """
     pointer-events: none;
     transition: transform 0.16s cubic-bezier(.34,1.36,.4,1);
   }
-  /* the center numeral — italic Fraunces in ink */
+  /* the center numeral, italic Fraunces in ink */
   .knob-label {
     position: absolute; z-index: 5; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -1361,7 +1362,7 @@ KNOB_HTML = """
     letter-spacing: -0.04em; pointer-events: none;
     text-shadow: 0 1px 0 rgba(255, 240, 220, 0.5), 0 -1px 0 rgba(42, 31, 45, 0.12);
   }
-  /* ticks — italic editorial numerals around the knob */
+  /* ticks, italic editorial numerals around the knob */
   .knob-ticks {
     display: flex; justify-content: space-between; width: 320px; margin: 28px auto 0;
     font-family: 'Fraunces', serif; font-style: italic; font-weight: 300;
@@ -1469,7 +1470,7 @@ STYLE_PRESETS = {
 }
 
 with gr.Blocks(title="Glossolalia Dial") as demo:
-    # Inject fonts via <link> — Gradio's CSS-in-JS strips @import, so the stylesheet
+    # Inject fonts via <link>, Gradio's CSS-in-JS strips @import, so the stylesheet
     # rule has to land in the document head as a tag, not in the CSS string.
     gr.HTML(
         """
@@ -1484,7 +1485,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
         """
     )
 
-    # lyric — magazine pull-quote spanning full width
+    # lyric, magazine pull-quote spanning full width
     sentence = gr.Textbox(label="the lyric", value=DEFAULT_TEXT, lines=2,
                           placeholder="anything; the dial will dissolve it",
                           elem_id="lyric-input")
@@ -1496,7 +1497,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
         mode = gr.Radio(choices=list(MODES), value=MODE_TONGUES,
                         label="the path", scale=1)
 
-    # custom voice — record or upload a 10-sec clip; F5-TTS clones it
+    # custom voice, record or upload a 10-sec clip; F5-TTS clones it
     with gr.Accordion("🎤  Clone your own voice  (record or upload 6-12 sec)",
                       open=False, elem_id="custom-voice-accord"):
         with gr.Row():
@@ -1513,7 +1514,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                 scale=1,
             )
 
-    # background music — upload an instrumental; we tempo-lock + mix the vocal over it
+    # background music, upload an instrumental; we tempo-lock + mix the vocal over it
     with gr.Accordion("🎵  Add background music  (mix a backing track under the voice)",
                       open=False, elem_id="music-accord"):
         with gr.Row():
@@ -1529,7 +1530,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
                 scale=1,
             )
 
-    # per-word overrides — stretch + pronunciation per individual word.
+    # per-word overrides, stretch + pronunciation per individual word.
     # Token preview HTML is Python-rendered on every lyric / state change so the markup
     # is always in sync. JS only handles the click-to-edit popover and writes the new
     # state back into the textbox below; Python then re-renders on that change.
@@ -1547,7 +1548,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
         # Click-to-edit on .token chips. Gradio v6 strips inline <script> tags inside
         # gr.HTML, so we register the delegated listener via demo.load(js=...) below.
 
-    # the dial — brass knob with vermillion arc and a Fraunces numeral center.
+    # the dial, brass knob with vermillion arc and a Fraunces numeral center.
     # Tick numbers sit in a semicircle above the knob (0 on the left, 4 on the right).
     # The knob's indicator is a pointer needle that lines up with the active tick.
     gr.HTML(
@@ -1617,7 +1618,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     # Holds the last DRY (pre-effect) voice so changing post-fx / music re-renders
     # instantly from it instead of re-running F5-TTS.
     dry_cache = gr.State(None)
-    # Hidden — stub metrics block, only shown after we wire real Whisper-WER + Resemblyzer.
+    # Hidden, stub metrics block, only shown after we wire real Whisper-WER + Resemblyzer.
     metrics = gr.HTML(readout(), visible=False)
 
     # Bind the brass knob to the hidden slider. Gradio strips inline <script> tags,
@@ -1748,7 +1749,7 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
         }""",
     )
 
-    # Click-to-edit on .token chips. Same demo.load(js=...) pattern as the knob —
+    # Click-to-edit on .token chips. Same demo.load(js=...) pattern as the knob -
     # inline <script> in gr.HTML is stripped by Gradio v6.
     demo.load(
         fn=None,

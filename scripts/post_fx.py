@@ -1,6 +1,6 @@
 """Audio post-FX bus for the Un-Language Slider.
 
-Closes the dry-TTS-sounds-like-a-phone-call gap with pedalboard DSP — NOT a Fraser claim,
+Closes the dry-TTS-sounds-like-a-phone-call gap with pedalboard DSP, NOT a Fraser claim,
 just a way to keep the toy from undermining itself. All effects are toggleable in the UI;
 default preset is gentle ('lush'). All processing is done on a stereo signal.
 

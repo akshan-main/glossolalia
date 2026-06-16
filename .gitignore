@@ -38,3 +38,9 @@ secrets/
 
 gradio_cached_examples/
 flagged/
+
+# internal project docs (kept local, out of the public repo)
+CLAUDE.md
+DECISIONS.md
+IDEA-AUDIT.md
+$STAGE/

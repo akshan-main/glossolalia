@@ -6,7 +6,7 @@ phoneme substitutions for graded corruption.
 
 A `--bias` preset reshapes the substitution distribution toward the empirical phoneme inventory of
 wordless vocal music. Default is `none` (raw English CMUdict distribution). Other presets are
-grounded in cited phonetic literature — see DECISIONS.md for the rationale + citations.
+grounded in cited phonetic literature, see DECISIONS.md for the rationale + citations.
 
 One-shot: downloads CMUdict on first run, caches to data/cmudict.dict.
 """
@@ -61,7 +61,7 @@ def build_distance_matrix() -> np.ndarray:
 # It is also saved as a per-phoneme weight vector (`bias_weights`) for use as the importance term
 # in the Boltzmann substitution kernel in scripts/corrupt_phonemes.py.
 #
-# IMPORTANT — provenance reality check:
+# IMPORTANT, provenance reality check:
 #   The specific multiplier values below are a hand-tuned design heuristic, not derived from
 #   published per-phoneme frequency tables. Earlier provenance comments overclaimed (Link &
 #   Tomaschek 2024 does NOT publish per-phoneme multipliers; Samarin's own data shows obstruent

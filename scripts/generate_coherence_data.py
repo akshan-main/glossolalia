@@ -2,7 +2,7 @@
 
 For each (sentence, voice, level): corrupt the sentence's phonemes at p(level), synthesize the
 result with the BASE F5-TTS in that voice, and write a wav + a row in manifest.jsonl. The
-manifest pairs each synthesized clip with its ORIGINAL sentence + level + voice — that's the
+manifest pairs each synthesized clip with its ORIGINAL sentence + level + voice, that's the
 (input, level) -> audio mapping the LoRA fine-tune later learns.
 
 Honest scaling note (read before running on Colab):
@@ -132,7 +132,7 @@ def main():
     written = 0
     skipped = 0
     for si, sentence in enumerate(sentences):
-        # cache corrupted texts per (sentence, level) — same across voices
+        # cache corrupted texts per (sentence, level), same across voices
         corrupted_by_level = {}
         for lv in range(args.levels):
             seed = args.seed_base + si * 31 + lv

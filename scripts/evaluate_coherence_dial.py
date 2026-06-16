@@ -3,7 +3,7 @@
 Per swept clip:
   - Whisper-WER vs the ORIGINAL typed sentence  (should RISE as dial level rises)
   - Resemblyzer cosine vs the level-0 same-voice/same-seed reference clip
-    (should stay >= 0.85 across all levels — voice preserved)
+    (should stay >= 0.85 across all levels, voice preserved)
 
 Aggregate:
   - mean WER per level (and per voice)
@@ -14,7 +14,7 @@ Aggregate:
 Verdict: PASS / PARTIAL / FAIL with a per-level breakdown JSON report.
 
 Hallucination guard: when Whisper's avg_logprob falls below the threshold the transcription is
-junk (model invented text) — we floor WER to 1.0 in that case so glossolalia doesn't get a
+junk (model invented text), we floor WER to 1.0 in that case so glossolalia doesn't get a
 spuriously LOW WER because the model dreamed coherent words from noise.
 """
 
