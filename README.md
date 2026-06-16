@@ -48,9 +48,9 @@ It is also not a DSP trick. Reverb, formant-shift, and vocoders act uniformly on
 
 ## How it was built
 
-There is no dataset of "sentences gradually dissolving into nonsense", so we made one.
+There is no dataset of "sentences gradually dissolving into nonsense", so we made one. This is the whole reason a single person can build this: instead of hunting for labeled data that does not exist, we manufacture the training target from plain text.
 
-1. Take 3000 public-domain sentences (Project Gutenberg + LibriSpeech).
+1. Take 3000 public-domain sentences (Project Gutenberg + LibriSpeech). Public-domain on purpose: the corpus is rights-clean and the build is reproducible end to end, which also keeps the project Off-the-Grid (no scraped or licensed text, no cloud calls).
 2. For each, generate five corrupted phoneme variants at substitution rates 0, 0.25, 0.5, 0.75, 1.0. The corruption keeps the English phoneme inventory, preserves syllable count and stress, and leans toward open CV syllables. This is grounded in the phonetics of real glossolalia (Samarin 1972, Goodman 1972; Link & Tomaschek 2024 measured 95.7% CV structure across 7,486 glossolalic syllables).
 3. Have base F5-TTS read each corrupted variant in two reference voices. That gives 30,000 (audio, original-sentence, level, voice) tuples.
 4. Fine-tune a LoRA so that, given the *original* sentence plus a `tongues N` token, it reproduces the level-N audio. The model never sees the corrupted text. It learns the mapping from the dial alone.
@@ -94,10 +94,11 @@ Nothing calls a cloud API. Every model runs on the Space.
 ## Links
 
 - **Model (LoRA):** https://huggingface.co/akshan-main/glossolalia-dial-lora
+- **Dataset (inputs):** https://huggingface.co/datasets/akshan-main/glossolalia-inputs
 - **Code:** https://github.com/akshan-main/glossolalia
 - **Field Notes:** https://github.com/akshan-main/glossolalia/blob/main/BLOG.md
-- **Demo video:** _TODO: add link before deadline_
-- **Social post:** _TODO: add link before deadline_
+- **Demo video:** https://youtu.be/dDOaBNfihyo
+- **Social post:** https://x.com/frutigeraerosol/status/2066667649338417367
 
 ## Team
 

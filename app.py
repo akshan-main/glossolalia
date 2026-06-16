@@ -1576,6 +1576,20 @@ with gr.Blocks(title="Glossolalia Dial") as demo:
     )
     level = gr.Slider(0, 4, value=0, step=1, label="", elem_id="dial-slider",
                       show_label=False, visible=True)
+    # The custom knob writes the dial value into this slider's <input type="range"> via JS,
+    # where a range input's value is always a STRING. Gradio's slider bounds-check does
+    # `value < minimum`, which raises "TypeError: '<' not supported between str and int" on a
+    # string and kills the request (it surfaced as the dial erroring when turned). Coerce to a
+    # number before the original preprocess so turning the knob can never crash. Instance-level
+    # override (not a subclass) so the component stays a plain Slider and the knob wiring holds.
+    _level_orig_preprocess = level.preprocess
+    def _level_safe_preprocess(payload, *args, **kwargs):
+        try:
+            payload = float(payload)
+        except (TypeError, ValueError):
+            payload = 0.0
+        return _level_orig_preprocess(payload, *args, **kwargs)
+    level.preprocess = _level_safe_preprocess
 
     # Live preview of what the audio will say, updates as the dial / mode / lyric change.
     ghost_lyric = gr.Textbox(label="what the voice will say at this dial position",

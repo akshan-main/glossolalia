@@ -76,6 +76,24 @@ LEVEL_P = [0.0, 0.25, 0.50, 0.75, 1.0]              # per-word substitution prob
 # lv4 (p=1.0, full dissolution) reaches 10 so every content word actually transforms.
 LEVEL_MAX_DIST = [0.0, 3.0, 5.0, 7.5, 10.0]
 
+# Per-level preference on candidate phonetic distance, added to the LM coherence score
+# during beam search. Negative = prefer the NEAREST (most natural) mishearing. Low dials
+# pull toward the closest swap so the change reads as a near-miss ("sells -> sills"); the
+# high dials sit at zero and let the nearest-skip below (LEVEL_SKIP_NEAR) do the work of
+# reaching for farther, weirder mishearings, with the LM picking the most coherent one in
+# that farther pool. Tuned against the LM score scale (mean per-token log-prob, ~-4 to -7).
+LEVEL_DIST_PREF = [0.0, -0.18, -0.09, 0.0, 0.0]
+
+# Fraction of each chosen word's NEAREST mishearings to drop from the beam's candidate pool,
+# per level. Zero at low dials so they keep the most natural (closest) swap. Rising at the top
+# so the same word is pushed past its obvious mishearing onto a farther, weirder one. This is
+# the saturation fix: a short sentence ("she sells seashells by the seashore", three content
+# words) has every word already changed by dial 3, so dial 4 has nothing new to change unless
+# it changes the SAME words further. The soft LEVEL_DIST_PREF alone can't dislodge a strongly
+# coherent near pick (the LM loves "seashells -> seagulls"); dropping the nearest candidates
+# forces the beam off it. Capped per-word so a short candidate ladder still keeps a handful.
+LEVEL_SKIP_NEAR = [0.0, 0.0, 0.0, 0.20, 0.55]
+
 # Minimum word-frequency (zipf scale, log10 per-billion) for a candidate to qualify.
 # CMUdict has ~135k entries including rare surnames / abbreviations ("selz" zipf 1.4).
 # zipf >= 2.5 keeps real mishearings ("seashells" 2.5, "reefer" 2.7) and rejects junk.
@@ -317,10 +335,12 @@ class MondegreenIndex:
             low = tok.lower()
             if low in _FUNCTION_WORDS:
                 continue
-            # Generous cap (12): once we DECIDE to change a word, it should always find
-            # its nearest real-word mishearing regardless of word length. The level
-            # gates the COUNT of changes, not the per-word distance.
-            cands = self.find_candidates(low, max_dist=12.0, max_results=n_candidates_per_word)
+            # Pull a WIDE ladder (24 within dist 13), not just the nearest few: the level
+            # gates both the COUNT of changes (which words, below) and HOW FAR each one
+            # drifts (the nearest-skip below), so the top dial needs farther candidates to
+            # reach for. best_dist still uses the nearest, so word-change ORDER is unchanged.
+            cands = self.find_candidates(low, max_dist=13.0,
+                                         max_results=max(24, n_candidates_per_word))
             if not cands:
                 continue
             substitutable.append(i)
@@ -341,9 +361,20 @@ class MondegreenIndex:
         chosen = sorted(substitutable, key=lambda i: (best_dist[i], i))[:k]
         chosen_set = set(chosen)
 
+        # Per-level: drop the nearest mishearings from each chosen word so high dials reach
+        # farther (the saturation fix; see LEVEL_SKIP_NEAR). Always keep >= 4 so the beam has
+        # room and a short candidate ladder doesn't collapse to a single forced choice.
+        skip_frac = LEVEL_SKIP_NEAR[level]
         per_position: list[list[tuple[str, float]] | None] = []
         for i, tok in enumerate(tokens):
-            per_position.append(cand_cache[i] if i in chosen_set else None)
+            if i not in chosen_set:
+                per_position.append(None)
+                continue
+            pool = cand_cache[i]
+            if skip_frac > 0.0 and len(pool) > 4:
+                drop = min(len(pool) - 4, int(skip_frac * len(pool)))
+                pool = pool[drop:]
+            per_position.append(pool)
 
         # Beam search. Each beam = (sequence_so_far: list[str], cumulative_log_prob: float).
         beams: list[tuple[list[str], float]] = [([], 0.0)]
@@ -366,9 +397,14 @@ class MondegreenIndex:
                     # Reuses prefix cache internally; this is fast.
                     partial_text = self._compose_partial(tokens, pos, new_seq)
                     lm_score = reranker.score_next_token(partial_text)
-                    # Tie-breaker: phonetic distance (lower = better), then alphabetical.
-                    tb = (-cand_dist * 1e-6, -ord(cand_word[0]) * 1e-9)
-                    expanded.append((new_seq, score + lm_score + tb[0] + tb[1]))
+                    # Distance preference scales with the dial (see LEVEL_DIST_PREF): low
+                    # dials prefer the nearest, most natural mishearing; high dials prefer a
+                    # farther, weirder one, so the same word drifts further as the dial rises
+                    # and dial 4 stays distinct from dial 3 even when the substitution count
+                    # has already saturated. Alphabetical micro-term keeps ties deterministic.
+                    dist_pref = LEVEL_DIST_PREF[level] * cand_dist
+                    alpha_tb = -ord(cand_word[0]) * 1e-9
+                    expanded.append((new_seq, score + lm_score + dist_pref + alpha_tb))
             if not expanded:
                 # Every candidate collided with an already-used word; keep the source.
                 beams = [(beam + [src_tok], score) for beam, score in beams]

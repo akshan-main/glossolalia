@@ -10,10 +10,10 @@ The hard part nobody asks about is the middle. Anyone can make "clean speech" an
 
 Two modes, one dial
 
-Same sentence, "she sells seashells by the seashore," same voice:
+Same sentence, "she sells seashells by the seashore," same voice, top of the dial:
 
-- Tongues, top of the dial: "schausel says luzor." Invented, pronounceable, meaningless.
-- Ghost, top of the dial: "she sills seagulls by the thistle." Every word swapped for a different real word that sounds close.
+- Tongues: invented, pronounceable words that keep the sentence's rhythm but mean nothing. A take might land on something like "schausel says luzor." It is sampled, so the exact sounds shift each time.
+- Ghost: "she shawls shuttles by the fissile," after sliding through "she shawls seagulls by the thistle" lower on the dial. Every word swapped for a different real word that sounds close. This one is deterministic, you get the same swap each run.
 
 Tongues is speaking-in-tongues. Ghost is what your brain does when you mishear a lyric.
 
@@ -45,9 +45,9 @@ The cause, once I found it, is a clean lesson. The LoRA and the zero-initialized
 
 Ghost, and why the reranking matters
 
-Ghost does not use the LoRA. It runs live. For each word it searches a pronunciation dictionary for real words that sound close, using a phonetic feature distance, not just spelling. The problem is that "close-sounding" alone surfaces garbage: rare surnames, abbreviations, words no one says. Early versions turned "seashells" into things like "selz."
+Ghost does not use the LoRA. It runs live. For each word it searches a pronunciation dictionary for real words that sound close, using a phonetic feature distance, not just spelling. The problem is that "close-sounding" alone surfaces garbage: rare surnames, abbreviations, words no one says. Early versions surfaced exactly that kind of junk.
 
-Two things fix it. A frequency filter throws out anything that is not common English. Then a small language model (DistilGPT-2) does a beam search over the candidate words and scores whole sequences by how likely they are as a sentence, so the output reads like a plausible mishearing instead of word salad. The dial controls how many words get swapped and how far the swap is allowed to go. Without the reranking, Ghost is noise. With it, "the river was wide and calm" becomes "the rougher was wide and come." That step is the whole mode.
+Two things fix it. A frequency filter throws out anything that is not common English. Then a small language model (DistilGPT-2) does a beam search over the candidate words and scores whole sequences by how likely they are as a sentence, so the output reads like a plausible mishearing instead of word salad. The dial controls both how many words get swapped and how far each swap is allowed to drift, so the same word slides to a stranger mishearing as you turn it up. Without the reranking, Ghost is noise. With it, "she sells seashells by the seashore" slides to "she shawls seagulls by the thistle." That step is the whole mode.
 
 Naming the two things honestly
 
