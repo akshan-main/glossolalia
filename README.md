@@ -22,7 +22,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
-It grabs F5-TTS and the dial LoRA on first run. CPU works, a GPU is much faster.
+It grabs F5-TTS and the dial LoRA on first run. CPU works, a GPU is much faster. 
+Base model as in https://huggingface.co/SWivid/F5-TTS
 
 ## Train the dial
 
@@ -40,6 +41,6 @@ There's no dataset of sentences falling apart into nonsense, so it builds one: c
 
 [How it was built, the bug that nearly killed it, and why it needs a finetune and not a reverb plugin.](https://x.com/frutigeraerosol/status/2066667649338417367)
 
-- Model: https://huggingface.co/akshan-main/glossolalia-dial-lora
+- Checkpoint: https://huggingface.co/akshan-main/glossolalia-dial-lora
 - Dataset: https://huggingface.co/datasets/akshan-main/glossolalia-inputs
 - Space: https://huggingface.co/spaces/build-small-hackathon/glossolalia
