@@ -39,7 +39,7 @@ There's no dataset of sentences falling apart into nonsense, so it builds one: c
 
 ## Writeup
 
-[How it was built, the bug that nearly killed it, and why it needs a finetune and not a reverb plugin.](https://x.com/frutigeraerosol/status/2066667649338417367)
+[How it was built, and why it needs a finetune and not a reverb plugin.](https://x.com/frutigeraerosol/status/2066667649338417367)
 
 - Checkpoint: https://huggingface.co/akshan-main/glossolalia-dial-lora
 - Dataset: https://huggingface.co/datasets/akshan-main/glossolalia-inputs
