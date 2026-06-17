@@ -37,7 +37,7 @@ modal token new
 modal run modal/app.py
 ```
 
-There's no dataset of sentences falling apart into nonsense, so it builds one: corrupt each sentence's phonemes at five rising rates, have base F5-TTS read each, then train the dial to reproduce that slide from the clean sentence alone. The model never sees the corrupted text. Ghost mode trains nothing, it just searches CMUdict for close-sounding words live and reranks them with DistilGPT-2.
+There's no dataset of sentences falling apart into nonsense, so I made one. I corrupted each sentence's phonemes at five rising rates, then made base F5-TTS read each, then trained the dial to reproduce that slide from the clean sentence alone. The model never sees the corrupted text. Ghost mode involved no training; it just searches CMUdict for close-sounding words live and reranks them with DistilGPT-2.
 
 ## Writeup
 
