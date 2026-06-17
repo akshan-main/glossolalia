@@ -8,7 +8,7 @@ Two modes:
 
 Live: https://huggingface.co/spaces/build-small-hackathon/glossolalia
 
-look into this (write-up)[https://x.com/frutigeraerosol/status/2066667649338417367] for a more detailed description for better understanding
+look into this [write-up](https://x.com/frutigeraerosol/status/2066667649338417367) for a more detailed description for better understanding
 
 Built for the HuggingFace and Gradio Build Small hackathon, Thousand Token Wood track, which wants small things that are genuinely original and a bit weird. The sound it chases is the wordless-vocals lineage, Cocteau Twins and Liz Fraser especially, where the voice is an instrument and the words stop mattering.
 
