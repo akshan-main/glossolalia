@@ -521,8 +521,10 @@ def speak(sentence, voice_id, level, postfx_preset, mode, seed,
     # serialized back across the process boundary; a path is trivial to pass, an array isn't.
     dry_path = _wav_to_filepath(y, sr)
     path = _apply_output_fx(y, sr, postfx_preset, music_path, music_gain_db)
-    readout_text = gen_text if (mode == MODE_GHOST and gen_text and gen_text != sentence) else ""
-    return path, readout(level, None, None, f"{mode.lower()} · lv{level}"), readout_text, dry_path
+    # Ghost mode shows the swapped words it actually spoke; Tongues has no fixed text, so leave
+    # the live preview as-is (gr.update) instead of blanking it after a take.
+    ghost_out = gen_text if (mode == MODE_GHOST and gen_text and gen_text != sentence) else gr.update()
+    return path, readout(level, None, None, f"{mode.lower()} · lv{level}"), ghost_out, dry_path
 
 
 @gpu_task
@@ -545,7 +547,7 @@ def morph(sentence, voice_id, postfx_preset, mode, seed,
     morphed = equal_power_concat(clips, sr_out, fade_ms=gap_ms)
     dry_path = _wav_to_filepath(morphed, sr_out)
     path = _apply_output_fx(morphed, sr_out, postfx_preset, music_path, music_gain_db)
-    return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), "", dry_path
+    return path, readout(None, None, None, f"{mode.lower()} · morphed 0->4"), gr.update(), dry_path
 
 
 def reapply_fx(dry_path, postfx_preset, music_path, music_gain_db):
