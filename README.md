@@ -15,7 +15,7 @@ Built for the HuggingFace and Gradio Build Small hackathon, Thousand Token Wood 
 ## Glossary
 
 - **Glossolalia** is speaking in tongues: fluent-sounding vocalizing that follows a language's sound rules but means nothing. That's Tongues mode.
-- **Mondegreen** is a misheard lyric, where your brain hears real words that were never there ("'scuse me while I kiss this guy"). That's Ghost mode.
+- **Mondegreen** is a misheard lyric, where your brain hears real words that were never there. That's Ghost mode.
 
 ## Run it
 
