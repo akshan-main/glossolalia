@@ -41,7 +41,7 @@ There's no dataset of sentences falling apart into nonsense, so I made one. I co
 
 ## Writeup
 
-[How it was built, and why it needs a finetune and not a reverb plugin.](https://x.com/frutigeraerosol/status/2066667649338417367)
+[How it was built? Why it needs a finetune? Why not a simple reverb plugin?](https://x.com/frutigeraerosol/status/2066667649338417367)
 
 - Checkpoint: https://huggingface.co/akshan-main/glossolalia-dial-lora
 - Dataset: https://huggingface.co/datasets/akshan-main/glossolalia-inputs
